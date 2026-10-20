@@ -129,7 +129,9 @@ def create_graph(
     classifier = QualificationService(settings)
 
     async def validate_input(state: AgentState) -> dict[str, Any]:
-        request = LeadRequest.model_validate(state["request"])
+        request = LeadRequest.model_validate(state["request"]).model_copy(
+            update={"target_leads": settings.number_of_leads}
+        )
         run_id = state.get("run_id") or str(uuid.uuid4())
         return {
             "request": request.model_dump(mode="json"),
@@ -488,11 +490,16 @@ def create_graph(
 
     async def prepare_proposal(state: AgentState) -> dict[str, Any]:
         candidates = _candidate_objects(state)
-        eligible: list[Candidate] = []
-        updated: list[Candidate] = []
+        request = LeadRequest.model_validate(state["request"])
+        eligible_all: list[Candidate] = []
         for candidate in candidates:
             if candidate.decision == Decision.QUALIFIED and candidate.website_status == WebsiteStatus.ACTIVE:
-                eligible.append(candidate.model_copy(update={"import_status": ImportStatus.PENDING_APPROVAL}))
+                eligible_all.append(candidate)
+        eligible = eligible_all[: request.target_leads]
+        selected_ids = {candidate.candidate_id for candidate in eligible}
+        updated: list[Candidate] = []
+        for candidate in candidates:
+            if candidate.candidate_id in selected_ids:
                 updated.append(candidate.model_copy(update={"import_status": ImportStatus.PENDING_APPROVAL}))
             elif candidate.decision == Decision.QUALIFIED and candidate.website_status == WebsiteStatus.INACTIVE:
                 updated.append(candidate.model_copy(update={"import_status": ImportStatus.SKIPPED_INACTIVE}))
@@ -676,18 +683,34 @@ def create_graph(
         imported = sum(c.import_status in {ImportStatus.IMPORTED, ImportStatus.ALREADY_EXISTS} for c in candidates)
         failures = sum(c.import_status == ImportStatus.FAILED for c in candidates)
         notes: list[str] = []
-        if imported < request.target_leads:
-            notes.append(f"Target was {request.target_leads}; {imported} CRM records were verified. More research or review may be needed.")
+        proposed_count = len(state.get("proposal", {}).get("candidate_ids", []))
+        target_shortfall = max(0, request.target_leads - proposed_count)
+        if target_shortfall:
+            notes.append(
+                f"Target was {request.target_leads}; {proposed_count} active qualified leads were found "
+                f"within the search budget. Shortfall: {target_shortfall}."
+            )
+        if imported < request.target_leads and state.get("approval", {}).get("approved"):
+            notes.append(
+                f"{imported} CRM records were verified after review; the reviewer may have approved only a subset."
+            )
         if uncertain:
             notes.append("Uncertain candidates were kept visible and were not auto-imported.")
         if inactive:
             notes.append("Inactive website results were retained for audit but excluded from the import proposal.")
         if settings.mock_mode:
-            notes.append("This run used synthetic mock sources and an in-memory CRM; data was not persisted to PostgreSQL.")
+            storage_note = (
+                "CRM records were stored in memory and will be cleared when the service stops."
+                if settings.database_url.startswith("memory://")
+                else "CRM records were stored in PostgreSQL."
+            )
+            notes.append(f"This run used synthetic mock sources. {storage_note}")
         report = AgentReport(
             request_id=request.request_id,
             run_id=run_id,
             requested_target=request.target_leads,
+            target_reached=target_shortfall == 0,
+            target_shortfall=target_shortfall,
             discovered_candidates=len(candidates),
             search_rounds=int(state.get("search_round", 0)),
             qualified=qualified,

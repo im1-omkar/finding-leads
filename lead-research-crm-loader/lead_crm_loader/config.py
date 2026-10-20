@@ -12,11 +12,18 @@ class Settings:
     llm_api_key: str | None = None
     llm_base_url: str | None = None
     llm_model: str = "gpt-4.1-mini"
+    llm_in_mock_mode: bool = False
     openrouter_api_key: str | None = None
     openrouter_site_url: str | None = None
     openrouter_app_name: str = "Lead Research & CRM Loader"
-    tavily_api_key: str | None = None
+    browserbase_api_key: str | None = None
+    browserbase_search_mode: str = "fast"
+    browserbase_max_concurrency: int = 1
+    langsmith_tracing: bool = False
+    langsmith_api_key: str | None = None
+    langsmith_project: str = "lead-research-crm-loader"
     database_url: str = "postgresql://postgres:postgres@localhost:5432/lead_crm_loader"
+    number_of_leads: int = 50
     max_candidates: int = 250
     max_search_rounds: int = 3
     max_concurrency: int = 6
@@ -28,23 +35,31 @@ class Settings:
         load_dotenv()
         mock_mode = os.getenv("MOCK_MODE", "true").lower() in {"1", "true", "yes", "on"}
         openrouter_key = os.getenv("OPENROUTER_API_KEY")
-        llm_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or openrouter_key
+        llm_key = os.getenv("LLM_API_KEY") or openrouter_key or os.getenv("OPENAI_API_KEY")
         base_url = os.getenv("LLM_BASE_URL")
-        if not base_url and openrouter_key:
+        if not base_url and openrouter_key and llm_key == openrouter_key:
             base_url = "https://openrouter.ai/api/v1"
-        default_model = "openai/gpt-4o-mini" if openrouter_key else "gpt-4.1-mini"
+        default_model = "openai/gpt-4o-mini" if base_url and "openrouter.ai" in base_url else "gpt-4.1-mini"
         database_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/lead_crm_loader")
+        number_of_leads = max(1, min(int(os.getenv("NUMBER_OF_LEADS", "50")), 200))
         return cls(
             mock_mode=mock_mode,
             llm_api_key=llm_key,
             llm_base_url=base_url,
             llm_model=os.getenv("LLM_MODEL", default_model),
+            llm_in_mock_mode=os.getenv("LLM_IN_MOCK_MODE", "false").lower() in {"1", "true", "yes", "on"},
             openrouter_api_key=openrouter_key,
             openrouter_site_url=os.getenv("OPENROUTER_SITE_URL"),
             openrouter_app_name=os.getenv("OPENROUTER_APP_NAME", "Lead Research & CRM Loader"),
-            tavily_api_key=os.getenv("TAVILY_API_KEY"),
+            browserbase_api_key=os.getenv("BROWSERBASE_API_KEY") or None,
+            browserbase_search_mode=os.getenv("BROWSERBASE_SEARCH_MODE", "fast").lower(),
+            browserbase_max_concurrency=max(1, min(int(os.getenv("BROWSERBASE_MAX_CONCURRENCY", "1")), 8)),
+            langsmith_tracing=os.getenv("LANGSMITH_TRACING", "false").lower() in {"1", "true", "yes", "on"},
+            langsmith_api_key=os.getenv("LANGSMITH_API_KEY") or None,
+            langsmith_project=os.getenv("LANGSMITH_PROJECT", "lead-research-crm-loader"),
             database_url=database_url,
-            max_candidates=max(1, min(int(os.getenv("MAX_CANDIDATES", "250")), 500)),
+            number_of_leads=number_of_leads,
+            max_candidates=max(number_of_leads, min(int(os.getenv("MAX_CANDIDATES", "250")), 1000)),
             max_search_rounds=max(1, min(int(os.getenv("MAX_SEARCH_ROUNDS", "3")), 5)),
             max_concurrency=max(1, min(int(os.getenv("MAX_CONCURRENCY", "6")), 16)),
             request_timeout_seconds=max(2.0, float(os.getenv("REQUEST_TIMEOUT_SECONDS", "12"))),
@@ -53,8 +68,8 @@ class Settings:
 
     def validate_for_live_mode(self) -> None:
         missing: list[str] = []
-        if not self.tavily_api_key:
-            missing.append("TAVILY_API_KEY")
+        if not self.browserbase_api_key:
+            missing.append("BROWSERBASE_API_KEY")
         if not self.llm_api_key:
             missing.append("LLM_API_KEY (or OPENAI_API_KEY / OPENROUTER_API_KEY)")
         if missing:

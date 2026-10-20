@@ -80,12 +80,13 @@ The current API has no reviewer authentication. It binds approval to a proposal 
 
 ## Adapters
 
-- `SearchProvider`: Tavily in live mode; deterministic fake search results in mock mode.
-- `WebsiteReader`: bounded `httpx` + BeautifulSoup reader in live mode; canned pages in mock mode.
+- `SearchProvider`: Browserbase Web Search in live mode; deterministic synthetic results in mock mode.
+- `WebsiteReader`: Browserbase Fetch in live mode, with a short-lived remote Playwright session for JavaScript-only pages; canned pages in mock mode.
 - `QualificationService`: optional structured-output LLM with conservative rule-based fallback for offline demos.
 - `CRMAdapter`: PostgreSQL CRM in application runs; in-memory adapter in offline tests and when `DATABASE_URL=memory://`.
+- `RunStore`: PostgreSQL-backed run/event/job tables for Compose deployments; in-memory run state for local API-only mode.
 
-The adapters can be replaced without changing graph control flow. This is useful for a deterministic test suite, switching search providers, or using Browserbase/Playwright behind a carefully tested public-page reader later.
+The adapters can be replaced without changing graph control flow. LangGraph tracing can be enabled with `LANGSMITH_TRACING=true` and a LangSmith key.
 
 ## Known production gaps
 

@@ -15,7 +15,7 @@ from lead_crm_loader.sources import MockSearchProvider, MockWebsiteReader
 
 @pytest.fixture
 async def full_run(tmp_path: Path):
-    settings = Settings(mock_mode=True, database_url="memory://", max_candidates=40, max_concurrency=3)
+    settings = Settings(mock_mode=True, database_url="memory://", max_candidates=250, max_concurrency=3)
     search = MockSearchProvider()
     reader = MockWebsiteReader()
     crm = InMemoryCRM()
@@ -31,7 +31,7 @@ async def full_run(tmp_path: Path):
         industry="AI software",
         region="Bengaluru",
         qualification_criteria=["B2B AI software company"],
-        target_leads=50,
+        target_leads=1,  # The configured environment target is authoritative.
     )
     config = {"configurable": {"thread_id": "test-run-001"}}
     first = await graph.ainvoke(
@@ -60,7 +60,7 @@ async def test_tc1_target_niche_has_source_per_unique_lead(full_run):
     report = full_run["report"]
     candidates = report["candidates"]
     canonical_qualified = [c for c in candidates if c["decision"] == "qualified" and c["website_status"] == "active"]
-    assert canonical_qualified
+    assert len(canonical_qualified) == 50
     assert all(c["source_evidence"] for c in canonical_qualified)
     assert all(any(e["source_url"] for e in c["source_evidence"]) for c in canonical_qualified)
     domains = [c["domain"] for c in canonical_qualified]
@@ -131,3 +131,10 @@ async def test_approval_is_mandatory_before_mock_crm_writes(tmp_path: Path):
     )
     assert final["report"]["imported"] == 0
     assert await crm.list_companies() == []
+
+
+def test_number_of_leads_is_read_from_environment(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("NUMBER_OF_LEADS", "17")
+    settings = Settings.from_env()
+    assert settings.number_of_leads == 17
+    assert settings.max_candidates >= 17

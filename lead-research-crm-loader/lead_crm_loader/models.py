@@ -185,6 +185,8 @@ class AgentReport(StrictModel):
     run_id: str
     generated_at: datetime = Field(default_factory=utc_now)
     requested_target: int
+    target_reached: bool
+    target_shortfall: int = Field(ge=0)
     discovered_candidates: int
     search_rounds: int = 0
     qualified: int

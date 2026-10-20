@@ -8,7 +8,7 @@ import re
 import socket
 from datetime import datetime, timezone
 from html import unescape
-from typing import Protocol
+from typing import Any, Protocol
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
@@ -156,39 +156,23 @@ class WebsiteReader(Protocol):
     async def verify(self, url: str) -> WebsiteSnapshot: ...
 
 
-class TavilySearchProvider:
-    def __init__(self, api_key: str, timeout: float = 12.0) -> None:
+class BrowserbaseSearchProvider:
+    """Search with Browserbase's structured Web Search REST API."""
+
+    API_URL = "https://api.browserbase.com/v1/search"
+
+    def __init__(self, api_key: str, timeout: float = 30.0, mode: str = "fast") -> None:
         self.api_key = api_key
         self.timeout = timeout
+        self.mode = mode if mode in {"fast"} else "fast"
 
     async def search(self, query: str, max_results: int = 20) -> list[SearchResult]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = None
-            for attempt in range(3):
-                try:
-                    response = await client.post(
-                        "https://api.tavily.com/search",
-                        json={
-                            "api_key": self.api_key,
-                            "query": query,
-                            "search_depth": "advanced",
-                            "max_results": min(max_results, 20),
-                            "include_answer": False,
-                            "include_raw_content": False,
-                        },
-                    )
-                    if response.status_code not in {429, 500, 502, 503, 504}:
-                        break
-                    if attempt < 2:
-                        retry_after = response.headers.get("retry-after")
-                        delay = min(4.0, float(retry_after)) if retry_after and retry_after.isdigit() else 0.6 * (2 ** attempt)
-                        await asyncio.sleep(delay)
-                except httpx.HTTPError:
-                    if attempt >= 2:
-                        raise
-                    await asyncio.sleep(0.6 * (2 ** attempt))
-            if response is None:
-                raise RuntimeError("Search provider returned no response")
+            response = await client.post(
+                self.API_URL,
+                headers={"X-BB-API-Key": self.api_key},
+                json={"provider": "parallel", "query": query[:200], "mode": self.mode, "numResults": min(max_results, 25)},
+            )
             response.raise_for_status()
             body = response.json()
         output: list[SearchResult] = []
@@ -196,11 +180,12 @@ class TavilySearchProvider:
             url = item.get("url")
             if not url:
                 continue
+            extra = " ".join(filter(None, [item.get("author"), item.get("publishedDate")]))
             output.append(
                 SearchResult(
                     title=(item.get("title") or normalized_domain(url))[:240],
                     url=url,
-                    snippet=(item.get("content") or "")[:2000],
+                    snippet=extra[:1000],
                     source_type="web_search_result",
                 )
             )
@@ -210,7 +195,7 @@ class TavilySearchProvider:
 class MockSearchProvider:
     """Deterministic fixtures for development and official-scenario testing."""
 
-    def __init__(self) -> None:
+    def __init__(self, target_leads: int = 50) -> None:
         self.results = [
             SearchResult(
                 title="Acme AI Private Limited",
@@ -243,10 +228,29 @@ class MockSearchProvider:
                 source_type="business_directory",
             ),
         ]
+        # Generate enough synthetic fixture leads to exercise the configured target
+        # while retaining the four named edge-case fixtures above.
+        synthetic_count = max(0, target_leads - 2)
+        for index in range(1, synthetic_count + 1):
+            name = f"Bengaluru AI Systems {index:03d} Private Limited"
+            domain = f"bengaluru-ai-systems-{index:03d}.example"
+            self.results.append(SearchResult(
+                title=name,
+                url=f"https://{domain}/",
+                snippet=f"{name} is a B2B AI software company based in Bengaluru. It builds enterprise machine-learning automation products. 25 employees.",
+                source_type="synthetic_mock",
+            ))
+        self._next_result = 0
+        self._lock = asyncio.Lock()
 
     async def search(self, query: str, max_results: int = 20) -> list[SearchResult]:
-        # Returning the same fixtures for each query intentionally exercises deduplication.
-        return self.results[:max_results]
+        # Partition results across concurrent queries so the mock can satisfy the
+        # configured target without repeatedly returning only the first page.
+        async with self._lock:
+            slot = self._next_result
+            self._next_result += 1
+        start = slot * max_results
+        return self.results[start : start + max_results]
 
 
 class PublicWebsiteReader:
@@ -394,6 +398,108 @@ class PublicWebsiteReader:
         return await self.fetch(url)
 
 
+class BrowserbaseWebsiteReader:
+    """Fetches pages through Browserbase, using a short-lived browser for JS-only pages."""
+
+    FETCH_URL = "https://api.browserbase.com/v1/fetch"
+    SESSIONS_URL = "https://api.browserbase.com/v1/sessions"
+
+    def __init__(self, api_key: str, timeout: float = 30.0, max_browser_concurrency: int = 1) -> None:
+        self.api_key = api_key
+        self.timeout = timeout
+        self._browser_slots = asyncio.Semaphore(max_browser_concurrency)
+        self._url_validator = PublicWebsiteReader(timeout=timeout)
+
+    @staticmethod
+    def _needs_browser(html: str) -> bool:
+        soup = BeautifulSoup(html or "", "html.parser")
+        text = " ".join(soup.get_text(" ", strip=True).split())
+        script_app = bool(soup.find("div", id=re.compile(r"^(root|app|__next)$")))
+        return len(text) < 180 and (script_app or bool(soup.find("script")))
+
+    async def _fetch_raw(self, url: str) -> tuple[str, int | None, str, str | None]:
+        current = url
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            for _ in range(6):
+                await asyncio.to_thread(self._url_validator._validate_public_url, current)
+                response = await client.post(
+                    self.FETCH_URL,
+                    headers={"X-BB-API-Key": self.api_key},
+                    json={"url": current, "allowRedirects": False, "allowInsecureSsl": False, "proxies": False, "format": "raw"},
+                )
+                response.raise_for_status()
+                body = response.json()
+                status = body.get("statusCode")
+                headers = {str(k).lower(): str(v) for k, v in (body.get("headers") or {}).items()}
+                if status in {301, 302, 303, 307, 308}:
+                    location = headers.get("location")
+                    if not location:
+                        return current, status, "", "Redirect did not include a location header"
+                    current = urljoin(current, location)
+                    continue
+                content = body.get("content", "")
+                if not isinstance(content, str):
+                    content = json.dumps(content)
+                error = body.get("message") or body.get("error")
+                return current, status, content[:1_000_000], str(error) if error else None
+        return current, None, "", "Too many redirects"
+
+    async def _fetch_in_browser(self, url: str) -> tuple[str | None, int | None, str | None]:
+        from playwright.async_api import async_playwright
+
+        async with self._browser_slots:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(
+                    self.SESSIONS_URL,
+                    headers={"X-BB-API-Key": self.api_key},
+                    json={"timeout": 60, "keepAlive": False},
+                )
+                response.raise_for_status()
+                session = response.json()
+
+            async with async_playwright() as playwright:
+                browser = await playwright.chromium.connect_over_cdp(session["connectUrl"])
+                try:
+                    context = browser.contexts[0]
+                    page = context.pages[0] if context.pages else await context.new_page()
+
+                    async def allow_public_request(route: Any) -> None:
+                        request_url = route.request.url
+                        try:
+                            await asyncio.to_thread(self._url_validator._validate_public_url, request_url)
+                        except (ValueError, RuntimeError):
+                            await route.abort()
+                        else:
+                            await route.continue_()
+
+                    await page.route("**/*", allow_public_request)
+                    response = await page.goto(url, wait_until="domcontentloaded", timeout=int(self.timeout * 1000))
+                    html = await page.content()
+                    status = response.status if response else None
+                    return page.url, status, html
+                finally:
+                    await browser.close()
+
+    async def fetch(self, url: str) -> WebsiteSnapshot:
+        try:
+            final_url, status, html, error = await self._fetch_raw(url)
+            if status is not None and 200 <= status < 300 and self._needs_browser(html):
+                browser_url, browser_status, browser_html = await self._fetch_in_browser(final_url)
+                if browser_html:
+                    final_url, status, html = browser_url or final_url, browser_status or status, browser_html
+            return PublicWebsiteReader._parse(url, final_url, status, html, error)
+        except (ValueError, RuntimeError, httpx.HTTPError, KeyError) as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            outcome = "inactive" if "DNS resolution failed" in message and any(
+                phrase in message.lower()
+                for phrase in ["name or service not known", "nodename nor servname", "no address associated", "nxdomain"]
+            ) else "unknown"
+            return WebsiteSnapshot(requested_url=url, status_code=None, outcome=outcome, error=message)
+
+    async def verify(self, url: str) -> WebsiteSnapshot:
+        return await self.fetch(url)
+
+
 class MockWebsiteReader:
     """Offline website fixtures; never makes network calls."""
 
@@ -423,6 +529,18 @@ class MockWebsiteReader:
         if domain == "gated-labs.example" and path.startswith("/contact"):
             html = "<html><title>Sign in required</title><body><form><input type='password'></form><p>Authentication required. Please log in.</p></body></html>"
             return PublicWebsiteReader._parse(url, url, 401, html, None)
+        synthetic = re.fullmatch(r"bengaluru-ai-systems-(\d{3})\.example", domain)
+        if synthetic:
+            index = int(synthetic.group(1))
+            name = f"Bengaluru AI Systems {index:03d} Private Limited"
+            html = (
+                f"<html><head><title>{name}</title>"
+                "<meta name='description' content='B2B AI software company based in Bengaluru, building "
+                "enterprise machine-learning automation products.'></head>"
+                f"<body><h1>{name}</h1><p>B2B AI software company based in Bengaluru. We build enterprise "
+                "machine-learning automation products. 25 employees.</p></body></html>"
+            )
+            return PublicWebsiteReader._parse(url, url, 200, html, None)
         status, html = self.PAGES.get(domain, (404, "<html><title>Not Found</title></html>"))
         return PublicWebsiteReader._parse(url, url, status, html, None)
 
@@ -437,10 +555,18 @@ class MockWebsiteReader:
 
 def build_source_adapters(settings: Settings) -> tuple[SearchProvider, WebsiteReader]:
     if settings.mock_mode:
-        return MockSearchProvider(), MockWebsiteReader()
-    if not settings.tavily_api_key:
-        raise RuntimeError("TAVILY_API_KEY is required when MOCK_MODE=false")
+        return MockSearchProvider(settings.number_of_leads), MockWebsiteReader()
+    if not settings.browserbase_api_key:
+        raise RuntimeError("BROWSERBASE_API_KEY is required when MOCK_MODE=false")
     return (
-        TavilySearchProvider(settings.tavily_api_key, timeout=settings.request_timeout_seconds),
-        PublicWebsiteReader(timeout=settings.request_timeout_seconds),
+        BrowserbaseSearchProvider(
+            settings.browserbase_api_key,
+            timeout=settings.request_timeout_seconds,
+            mode=settings.browserbase_search_mode,
+        ),
+        BrowserbaseWebsiteReader(
+            settings.browserbase_api_key,
+            timeout=settings.request_timeout_seconds,
+            max_browser_concurrency=settings.browserbase_max_concurrency,
+        ),
     )

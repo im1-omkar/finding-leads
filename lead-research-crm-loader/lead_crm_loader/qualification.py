@@ -100,7 +100,7 @@ class LLMClassifier:
         if settings.llm_base_url:
             kwargs["base_url"] = settings.llm_base_url
         default_headers: dict[str, str] = {}
-        if settings.openrouter_api_key:
+        if settings.openrouter_api_key and settings.llm_api_key == settings.openrouter_api_key and settings.llm_base_url and "openrouter.ai" in settings.llm_base_url:
             if settings.openrouter_site_url:
                 default_headers["HTTP-Referer"] = settings.openrouter_site_url
             if settings.openrouter_app_name:
@@ -142,7 +142,7 @@ class QualificationService:
         self.settings = settings
         self.fallback = RuleBasedClassifier(settings.min_confidence)
         self.llm = None
-        if settings.llm_api_key:
+        if settings.llm_api_key and (not settings.mock_mode or settings.llm_in_mock_mode):
             try:
                 self.llm = LLMClassifier(settings)
             except Exception:
