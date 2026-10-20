@@ -67,14 +67,14 @@ All web evidence is untrusted input. A page may contain promotional claims or ad
 4. Directory URLs are kept as evidence; a directory's domain is not treated as the company's domain when an official URL cannot be established.
 5. Uncertain candidates stay visible but are not automatically imported.
 6. Exact domain/name duplicates are merged; fuzzy matches should become review suggestions, not automatic merges.
-7. CRM writes are idempotent within the mock adapter, and the HubSpot adapter searches for existing company records before creating.
+7. CRM writes use PostgreSQL idempotency keys and check for existing domain/name records before creating.
 8. Every imported/existing record is read back and compared with the intended name/domain.
 9. 404/410 mark a site inactive for this scenario; timeout, 429, 5xx and ambiguous outcomes remain inconclusive unless independent evidence confirms inactivity.
 10. Restricted contact pages are skipped without authentication attempts or bypasses.
 
 ## State persistence and human approval
 
-The API assigns the run ID as LangGraph's `thread_id`. The SQLite checkpointer saves graph state when the `approval_gate` calls `interrupt(...)`; the approval endpoint resumes that same thread with `Command(resume=...)`. Keep the proposal preparation outside the interrupt node because LangGraph may re-run that node when a paused graph resumes.
+The API assigns the run ID as LangGraph's `thread_id`. The PostgreSQL checkpointer saves graph state when the `approval_gate` calls `interrupt(...)`; the approval endpoint resumes that same thread with `Command(resume=...)`. Keep the proposal preparation outside the interrupt node because LangGraph may re-run that node when a paused graph resumes.
 
 The current API has no reviewer authentication. It binds approval to a proposal and reviewer ID, but production deployment must additionally authenticate the reviewer and verify authorization to approve that run.
 
@@ -83,7 +83,7 @@ The current API has no reviewer authentication. It binds approval to a proposal 
 - `SearchProvider`: Tavily in live mode; deterministic fake search results in mock mode.
 - `WebsiteReader`: bounded `httpx` + BeautifulSoup reader in live mode; canned pages in mock mode.
 - `QualificationService`: optional structured-output LLM with conservative rule-based fallback for offline demos.
-- `CRMAdapter`: SQLite mock CRM by default; HubSpot Company Object API in live mode.
+- `CRMAdapter`: PostgreSQL CRM in application runs; in-memory adapter in offline tests and when `DATABASE_URL=memory://`.
 
 The adapters can be replaced without changing graph control flow. This is useful for a deterministic test suite, switching search providers, or using Browserbase/Playwright behind a carefully tested public-page reader later.
 

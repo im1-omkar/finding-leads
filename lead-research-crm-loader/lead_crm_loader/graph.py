@@ -505,7 +505,7 @@ def create_graph(
             "proposal_version": 1,
             "request_id": state["request"]["request_id"],
             "proposal_hash": digest,
-            "destination": "HubSpot test account" if not settings.mock_mode else "Local mock CRM",
+            "destination": "PostgreSQL CRM",
             "candidate_ids": eligible_ids,
             "changes": [
                 {
@@ -683,7 +683,7 @@ def create_graph(
         if inactive:
             notes.append("Inactive website results were retained for audit but excluded from the import proposal.")
         if settings.mock_mode:
-            notes.append("This run used synthetic mock sources and a local mock CRM; it did not write to HubSpot.")
+            notes.append("This run used synthetic mock sources and an in-memory CRM; data was not persisted to PostgreSQL.")
         report = AgentReport(
             request_id=request.request_id,
             run_id=run_id,

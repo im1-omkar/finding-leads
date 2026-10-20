@@ -5,12 +5,12 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from .config import Settings
-from .crm import HubSpotCRM, MockCRM, build_crm_adapter
+from .crm import PostgresCRM, build_crm_adapter
 from .graph import create_graph
 from .models import ApprovalDecision, LeadRequest
 from .sources import build_source_adapters
@@ -34,9 +34,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # AsyncSqliteSaver is required because the HTTP API calls graph.ainvoke/aget_state.
-        async with AsyncSqliteSaver.from_conn_string(settings.sqlite_path) as checkpointer:
-            await checkpointer.setup()
+        # Use PostgreSQL checkpointer when database_url points to postgres,
+        # otherwise fall back to InMemorySaver for local/test runs.
+        if settings.database_url.startswith(("postgres://", "postgresql://")):
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+            async with AsyncPostgresSaver.from_conn_string(settings.database_url) as checkpointer:
+                await checkpointer.setup()
+                if isinstance(crm_adapter, PostgresCRM):
+                    await crm_adapter.setup()
+                app.state.graph = create_graph(
+                    settings=settings,
+                    search_provider=search_provider,
+                    website_reader=website_reader,
+                    crm_adapter=crm_adapter,
+                    checkpointer=checkpointer,
+                )
+                yield
+                await crm_adapter.aclose()
+        else:
+            checkpointer = InMemorySaver()
             app.state.graph = create_graph(
                 settings=settings,
                 search_provider=search_provider,
@@ -45,8 +62,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 checkpointer=checkpointer,
             )
             yield
-            if isinstance(crm_adapter, HubSpotCRM):
-                await crm_adapter.aclose()
+            await crm_adapter.aclose()
 
     app = FastAPI(
         title="Lead Research & CRM Loader Agent",
@@ -138,22 +154,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail="Report is not ready yet; the run may be awaiting approval")
         return report
 
-    @app.get("/mock-crm/companies")
-    async def list_mock_companies(request: Request) -> dict[str, Any]:
+    @app.get("/crm/companies")
+    async def list_companies(request: Request) -> dict[str, Any]:
         adapter = request.app.state.crm_adapter
-        if not isinstance(adapter, MockCRM):
-            raise HTTPException(status_code=404, detail="Mock CRM is disabled in live mode")
         return {"results": await adapter.list_companies()}
 
-    @app.get("/mock-crm/companies/{record_id}")
-    async def get_mock_company(record_id: str, request: Request) -> dict[str, Any]:
+    @app.get("/crm/companies/{record_id}")
+    async def get_company(record_id: str, request: Request) -> dict[str, Any]:
         adapter = request.app.state.crm_adapter
-        if not isinstance(adapter, MockCRM):
-            raise HTTPException(status_code=404, detail="Mock CRM is disabled in live mode")
         record = await adapter.get_company(record_id)
         if not record:
             raise HTTPException(status_code=404, detail="Company record not found")
         return record
+
+    # Backward-compatible aliases
+    @app.get("/mock-crm/companies")
+    async def list_mock_companies(request: Request) -> dict[str, Any]:
+        return await list_companies(request)
+
+    @app.get("/mock-crm/companies/{record_id}")
+    async def get_mock_company(record_id: str, request: Request) -> dict[str, Any]:
+        return await get_company(record_id, request)
 
     return app
 

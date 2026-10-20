@@ -7,14 +7,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HOST=0.0.0.0 \
     PORT=8000
 
-# Install runtime dependencies (curl for healthcheck)
+# Install runtime dependencies (curl for healthcheck, libpq for PostgreSQL)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user and app directory
 RUN useradd -m -u 1000 appuser && \
-    mkdir -p /app/data && \
+    mkdir -p /app && \
     chown -R appuser:appuser /app
 
 WORKDIR /app

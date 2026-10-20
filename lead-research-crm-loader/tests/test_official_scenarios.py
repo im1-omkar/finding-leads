@@ -7,7 +7,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
 from lead_crm_loader.config import Settings
-from lead_crm_loader.crm import MockCRM
+from lead_crm_loader.crm import InMemoryCRM
 from lead_crm_loader.graph import create_graph
 from lead_crm_loader.models import LeadRequest
 from lead_crm_loader.sources import MockSearchProvider, MockWebsiteReader
@@ -15,11 +15,10 @@ from lead_crm_loader.sources import MockSearchProvider, MockWebsiteReader
 
 @pytest.fixture
 async def full_run(tmp_path: Path):
-    db_path = str(tmp_path / "agent-test.sqlite3")
-    settings = Settings(mock_mode=True, sqlite_path=db_path, max_candidates=40, max_concurrency=3)
+    settings = Settings(mock_mode=True, database_url="memory://", max_candidates=40, max_concurrency=3)
     search = MockSearchProvider()
     reader = MockWebsiteReader()
-    crm = MockCRM(db_path)
+    crm = InMemoryCRM()
     graph = create_graph(
         settings=settings,
         search_provider=search,
@@ -99,9 +98,8 @@ async def test_tc4_login_gated_contact_page_is_skipped(full_run):
 
 @pytest.mark.asyncio
 async def test_approval_is_mandatory_before_mock_crm_writes(tmp_path: Path):
-    db_path = str(tmp_path / "approval-test.sqlite3")
-    settings = Settings(mock_mode=True, sqlite_path=db_path, max_candidates=40, max_concurrency=3)
-    crm = MockCRM(db_path)
+    settings = Settings(mock_mode=True, database_url="memory://", max_candidates=40, max_concurrency=3)
+    crm = InMemoryCRM()
     graph = create_graph(
         settings=settings,
         search_provider=MockSearchProvider(),

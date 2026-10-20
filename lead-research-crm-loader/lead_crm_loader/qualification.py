@@ -99,6 +99,14 @@ class LLMClassifier:
         }
         if settings.llm_base_url:
             kwargs["base_url"] = settings.llm_base_url
+        default_headers: dict[str, str] = {}
+        if settings.openrouter_api_key:
+            if settings.openrouter_site_url:
+                default_headers["HTTP-Referer"] = settings.openrouter_site_url
+            if settings.openrouter_app_name:
+                default_headers["X-Title"] = settings.openrouter_app_name
+        if default_headers:
+            kwargs["default_headers"] = default_headers
         self.model = ChatOpenAI(**kwargs).with_structured_output(Classification)
 
     async def classify(self, request: LeadRequest, candidate: Candidate) -> Classification:
