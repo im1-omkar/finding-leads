@@ -1,0 +1,31 @@
+services:
+  lead-crm-loader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lead-research-crm-loader:latest
+    container_name: lead-research-crm-loader
+    ports:
+      - "8000:8000"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - MOCK_MODE=true
+      - SQLITE_PATH=/app/data/lead_crm_loader.sqlite3
+    env_file:
+      - path: ./lead-research-crm-loader/.env
+        required: false
+      - path: ./.env
+        required: false
+    volumes:
+      - crm_data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  crm_data:

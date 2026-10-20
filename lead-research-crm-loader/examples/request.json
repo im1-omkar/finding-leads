@@ -1,0 +1,15 @@
+{
+  "request_id": "demo-ai-bengaluru-001",
+  "industry": "AI software",
+  "region": "Bengaluru",
+  "company_size": {
+    "min_employees": null,
+    "max_employees": null
+  },
+  "qualification_criteria": [
+    "B2B AI software company",
+    "Has a working official website",
+    "Public evidence of an AI product or service"
+  ],
+  "target_leads": 50
+}
