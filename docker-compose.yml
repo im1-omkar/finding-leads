@@ -29,7 +29,6 @@ services:
     environment:
       - HOST=0.0.0.0
       - PORT=8000
-      - FRONTEND_ORIGINS=http://localhost:3000
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/lead_crm_loader
     env_file:
       - path: ./lead-research-crm-loader/.env

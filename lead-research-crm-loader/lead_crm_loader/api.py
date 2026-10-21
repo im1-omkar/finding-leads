@@ -3,15 +3,32 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import secrets
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel, Field
+
+from .auth import (
+    CSRF_COOKIE,
+    DUMMY_PASSWORD_HASH,
+    SESSION_COOKIE,
+    clear_session_cookies,
+    current_user,
+    hash_token,
+    issue_session,
+    new_user_id,
+    password_hash,
+    password_matches,
+    send_auth_email,
+    validate_csrf,
+)
 
 from .config import Settings
 from .crm import PostgresCRM, build_crm_adapter
@@ -26,8 +43,30 @@ class ApprovalBody(BaseModel):
     approved: bool
     proposal_hash: str
     approved_candidate_ids: list[str] = Field(default_factory=list)
-    reviewer_id: str = Field(min_length=1, max_length=160)
     comment: str | None = Field(default=None, max_length=2000)
+
+
+class Credentials(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=10, max_length=256)
+
+class TokenBody(BaseModel):
+    token: str = Field(min_length=20, max_length=200)
+
+
+class EmailBody(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+
+class ResetBody(TokenBody):
+    password: str = Field(min_length=10, max_length=256)
+
+
+def _email(value: str) -> str:
+    normalized = value.strip().lower()
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", normalized):
+        raise HTTPException(status_code=422, detail="Enter a valid email address.")
+    return normalized
 
 
 def _configure_langsmith(settings: Settings) -> None:
@@ -39,6 +78,8 @@ def _configure_langsmith(settings: Settings) -> None:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
+    if os.getenv("APP_ENV", "development").lower() == "production" and len(os.getenv("APP_SESSION_SECRET", "")) < 32:
+        raise RuntimeError("Production requires APP_SESSION_SECRET to contain at least 32 characters.")
     if not settings.mock_mode:
         settings.validate_for_live_mode()
     _configure_langsmith(settings)
@@ -83,13 +124,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
-        allow_credentials=False,
+        allow_credentials=True,
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type", "Last-Event-ID"],
+        allow_headers=["Content-Type", "Last-Event-ID", "X-CSRF-Token"],
     )
     app.state.settings = settings
     app.state.crm_adapter = crm_adapter
     app.state.run_store = store
+    app.state.auth_store = store
     app.state.local_tasks = set()
 
     async def execute_local_job(job: dict[str, Any]) -> None:
@@ -110,6 +152,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.local_tasks.add(task)
         task.add_done_callback(app.state.local_tasks.discard)
 
+    # health check of application
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok", "mode": "mock" if settings.mock_mode else "live"}
@@ -124,12 +167,95 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "langsmith_enabled": settings.langsmith_tracing and bool(settings.langsmith_api_key),
         }
 
+    @app.post("/auth/register", status_code=201)
+    async def register(body: Credentials, request: Request, response: Response) -> dict[str, Any]:
+        email = _email(body.email)
+        user = await store.create_user(new_user_id(), email, password_hash(body.password))
+        if not user:
+            raise HTTPException(status_code=409, detail="An account with this email already exists.")
+        await issue_session(store, user["user_id"], response, os.getenv("APP_ENV", "development").lower() == "production")
+        return {"message": "Account created.", "user": {"user_id": user["user_id"], "email": user["email"]}}
+
+    @app.post("/auth/login")
+    async def login(body: Credentials, request: Request, response: Response) -> dict[str, Any]:
+        email = _email(body.email)
+        user = await store.get_user_by_email(email)
+        # Always perform a password hash verification when the user exists; never expose account state.
+        password_valid = password_matches(user["password_hash"] if user else DUMMY_PASSWORD_HASH, body.password)
+        if not user or not password_valid:
+            raise HTTPException(status_code=401, detail="Email or password is incorrect.")
+        await issue_session(store, user["user_id"], response, os.getenv("APP_ENV", "development").lower() == "production")
+        return {"user": {"user_id": user["user_id"], "email": user["email"]}}
+
+    @app.post("/auth/logout")
+    async def logout(request: Request, response: Response) -> dict[str, str]:
+        user = await current_user(request)
+        validate_csrf(request)
+        session_token = request.cookies.get(SESSION_COOKIE)
+        if session_token:
+            await store.delete_session(hash_token(session_token))
+        clear_session_cookies(response, os.getenv("APP_ENV", "development").lower() == "production")
+        return {"message": "Signed out."}
+
+    @app.get("/auth/me")
+    async def me(request: Request) -> dict[str, Any]:
+        user = await current_user(request)
+        return {"user_id": user["user_id"], "email": user["email"]}
+
+    @app.post("/auth/verify-email")
+    async def verify_email(body: TokenBody) -> dict[str, str]:
+        user_id = await store.consume_auth_token(hash_token(body.token), "verify")
+        if not user_id:
+            raise HTTPException(status_code=400, detail="Verification link is invalid or expired.")
+        await store.mark_email_verified(user_id)
+        return {"message": "Email verified. You can now sign in."}
+
+    @app.post("/auth/resend-verification")
+    async def resend_verification(body: EmailBody, request: Request) -> dict[str, str]:
+        email = _email(body.email)
+        user = await store.get_user_by_email(email)
+        if user and not user["email_verified"]:
+            token = secrets.token_urlsafe(36)
+            from datetime import datetime, timedelta, timezone
+            await store.create_auth_token(user["user_id"], hash_token(token), "verify", datetime.now(timezone.utc) + timedelta(minutes=30))
+            await send_auth_email(request, email, "Verify your Lead Research account", token, "verify-email")
+        return {"message": "If the account needs verification, a new link has been sent."}
+
+    @app.post("/auth/forgot-password")
+    async def forgot_password(body: EmailBody, request: Request) -> dict[str, str]:
+        email = _email(body.email)
+        user = await store.get_user_by_email(email)
+        if user:
+            token = secrets.token_urlsafe(36)
+            from datetime import datetime, timedelta, timezone
+            await store.create_auth_token(user["user_id"], hash_token(token), "reset", datetime.now(timezone.utc) + timedelta(minutes=30))
+            await send_auth_email(request, email, "Reset your Lead Research password", token, "reset-password")
+        return {"message": "If the account exists, a reset link has been sent."}
+
+    @app.post("/auth/reset-password")
+    async def reset_password(body: ResetBody) -> dict[str, str]:
+        user_id = await store.consume_auth_token(hash_token(body.token), "reset")
+        if not user_id:
+            raise HTTPException(status_code=400, detail="Password reset link is invalid or expired.")
+        await store.set_password(user_id, password_hash(body.password))
+        return {"message": "Password updated. Sign in with your new password."}
+
+    @app.get("/runs")
+    async def list_runs(request: Request, limit: int = 20, offset: int = 0, status_filter: str | None = None) -> dict[str, Any]:
+        user = await current_user(request)
+        if limit < 1 or limit > 100 or offset < 0:
+            raise HTTPException(status_code=422, detail="Invalid pagination.")
+        rows, total = await store.list_runs(user["user_id"], limit, offset, status_filter)
+        return {"results": rows, "total": total, "limit": limit, "offset": offset}
+
     @app.post("/runs", status_code=202)
     async def start_run(request_body: LeadRequest, request: Request) -> dict[str, Any]:
+        user = await current_user(request)
+        validate_csrf(request)
         run_id = str(uuid.uuid4())
         authoritative_request = request_body.model_copy(update={"target_leads": settings.number_of_leads})
         run_payload = authoritative_request.model_dump(mode="json")
-        await store.create_run(run_id, run_payload)
+        await store.create_run(run_id, run_payload, user["user_id"])
         if not use_postgres:
             start_local_task({"job_type": "start", "run_id": run_id, "payload": {"request": run_payload}})
         return {
@@ -141,6 +267,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/runs/{run_id}")
     async def get_run(run_id: str, request: Request) -> dict[str, Any]:
+        user = await current_user(request)
+        if not await store.owns_run(run_id, user["user_id"]):
+            raise HTTPException(status_code=404, detail="Run not found")
         run = await store.get_run(run_id)
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
@@ -158,7 +287,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/runs/{run_id}/events")
     async def run_events(run_id: str, request: Request, after_id: int = 0) -> StreamingResponse:
-        if not await store.get_run(run_id):
+        user = await current_user(request)
+        if not await store.owns_run(run_id, user["user_id"]):
             raise HTTPException(status_code=404, detail="Run not found")
         try:
             cursor = max(after_id, int(request.headers.get("last-event-id", "0")))
@@ -188,12 +318,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    @app.get("/runs/{run_id}/events/history")
+    async def run_event_history(run_id: str, request: Request, after_id: int = 0) -> dict[str, Any]:
+        user = await current_user(request)
+        if not await store.owns_run(run_id, user["user_id"]):
+            raise HTTPException(status_code=404, detail="Run not found")
+        events = await store.events_after(run_id, max(after_id, 0))
+        return {"results": events, "last_event_id": events[-1]["id"] if events else max(after_id, 0)}
+
     @app.post("/runs/{run_id}/approval", status_code=202)
     async def resume_with_approval(run_id: str, body: ApprovalBody, request: Request) -> dict[str, Any]:
+        user = await current_user(request)
+        validate_csrf(request)
         try:
-            decision = ApprovalDecision.model_validate(body.model_dump())
+            decision = ApprovalDecision.model_validate({**body.model_dump(), "reviewer_id": user["email"]})
         except Exception as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if not await store.owns_run(run_id, user["user_id"]):
+            raise HTTPException(status_code=404, detail="Run not found")
         run = await store.get_run(run_id)
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
@@ -215,6 +357,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/runs/{run_id}/report")
     async def get_report(run_id: str, request: Request) -> dict[str, Any]:
+        user = await current_user(request)
+        if not await store.owns_run(run_id, user["user_id"]):
+            raise HTTPException(status_code=404, detail="Run not found")
         run = await store.get_run(run_id)
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
@@ -224,10 +369,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/crm/companies")
     async def list_companies(request: Request) -> dict[str, Any]:
+        await current_user(request)
         return {"results": await request.app.state.crm_adapter.list_companies()}
 
     @app.get("/crm/companies/{record_id}")
     async def get_company(record_id: str, request: Request) -> dict[str, Any]:
+        await current_user(request)
         record = await request.app.state.crm_adapter.get_company(record_id)
         if not record:
             raise HTTPException(status_code=404, detail="Company record not found")

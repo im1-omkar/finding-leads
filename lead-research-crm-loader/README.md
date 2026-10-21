@@ -35,15 +35,31 @@ docker compose up --build --force-recreate
 
 ## Use the application
 
-1. Enter the industry, region, optional employee range, and qualification criteria in the UI.
-2. Start a run and follow its progress. The service retains public source URLs, excerpts, decision rationale, and website verification results.
-3. Review the versioned proposal and select the company records to import. No CRM write occurs before this approval.
-4. After approval, the worker upserts the selected records to PostgreSQL and reads them back to verify name/domain.
-5. Review the final report, target count, imports, and shortfall in the UI or through the API.
+1. Create an account, then open the verification link. In development (without SMTP), the backend prints this link in its logs.
+2. Sign in, enter the industry, region, optional employee range, and qualification criteria, then start a run.
+3. Follow live worker stages and the timestamped activity log. Runs are retained in your private history.
+4. Review the versioned proposal and select the company records to import. No CRM write occurs before approval.
+5. After approval, the worker upserts selected records to PostgreSQL and reads them back to verify name/domain.
+
+Account verification and password reset links expire after 30 minutes and are single-use. Sessions last seven days and are stored server-side; only a random token is placed in an HttpOnly cookie. In development, auth links are written to backend logs. Configure SMTP before production use:
+
+```dotenv
+APP_ENV=production
+APP_SESSION_SECRET=generate-a-random-secret-of-at-least-32-characters
+FRONTEND_PUBLIC_URL=https://your-app.example
+SMTP_HOST=smtp.your-provider.example
+SMTP_PORT=587
+SMTP_FROM=Lead Research <noreply@your-app.example>
+SMTP_USERNAME=your-smtp-user
+SMTP_PASSWORD=your-smtp-password
+FRONTEND_ORIGINS=https://your-app.example
+```
+
+Production cookies are marked Secure. Use HTTPS for the frontend and API. Existing runs created before accounts were introduced remain in the database with no owner and are not exposed in any user's history.
 
 Run pages use a `run_id` query parameter so a saved run can be reopened in the review UI after a refresh.
 
-The API also exposes `GET /config`, `POST /runs`, `GET /runs/{run_id}`, `GET /runs/{run_id}/events` (server-sent events), `POST /runs/{run_id}/approval`, `GET /runs/{run_id}/report`, and `GET /crm/companies`.
+The API exposes `/auth/register`, `/auth/login`, `/auth/logout`, `/auth/me`, `/auth/verify-email`, `/auth/resend-verification`, `/auth/forgot-password`, and `/auth/reset-password`. Authenticated users can list their own runs with `GET /runs?limit=20&offset=0&status_filter=completed`, open run details/events/reports, and submit approvals. Mutating requests use the readable `lead_csrf` cookie value in the `X-CSRF-Token` header. CRM reads also require a signed-in account.
 
 ## Live research setup
 
@@ -99,4 +115,4 @@ curl http://localhost:8000/crm/companies
 
 ## Architecture and limitations
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the graph nodes, state flow, data contracts, persistence, and safety invariants. The demo API does not authenticate reviewers. Add authentication/authorization, rate budgets, and operational monitoring before exposing it beyond a trusted local environment.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the graph nodes, state flow, data contracts, persistence, and safety invariants. Authentication and per-run ownership are enforced by the API. Add rate limits, email abuse protections, and operational monitoring before exposing it beyond a trusted local environment.
