@@ -15,6 +15,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
 from .config import Settings
+from .call_budget import current_budget
 from .crm import CRMAdapter, build_crm_adapter
 from .deduplication import deduplicate_candidates
 from .models import (
@@ -49,6 +50,7 @@ class AgentState(TypedDict, total=False):
     seen_urls: list[str]
     search_round: int
     new_results_count: int
+    unprocessed_urls: list[dict[str, Any]]
     candidates: list[dict[str, Any]]
     proposal: dict[str, Any]
     proposal_hash: str
@@ -128,6 +130,9 @@ def create_graph(
     crm_adapter = crm_adapter or build_crm_adapter(settings)
     classifier = QualificationService(settings)
 
+    def search_round_limit(request: LeadRequest) -> int:
+        return min(settings.max_search_rounds, 1) if request.test_mode else settings.max_search_rounds
+
     async def validate_input(state: AgentState) -> dict[str, Any]:
         request = LeadRequest.model_validate(state["request"]).model_copy(
             update={"target_leads": settings.number_of_leads}
@@ -143,7 +148,8 @@ def create_graph(
         request = LeadRequest.model_validate(state["request"])
         round_number = int(state.get("search_round", 0)) + 1
         existing_urls = set(state.get("seen_urls", []))
-        remaining_budget = max(0, settings.max_candidates - len(existing_urls))
+        candidate_limit = min(settings.max_candidates, settings.test_mode_candidate_url_limit) if request.test_mode else settings.max_candidates
+        remaining_budget = max(0, candidate_limit - len(existing_urls))
         size_text = ""
         if request.company_size.min_employees or request.company_size.max_employees:
             size_text = f" companies with {request.company_size.min_employees or 1}-{request.company_size.max_employees or 'many'} employees"
@@ -210,6 +216,7 @@ def create_graph(
                 break
         return {
             "search_results": [item.model_dump(mode="json") for item in found],
+            "unprocessed_urls": [item.model_dump(mode="json") for item in found],
             "seen_urls": sorted(seen),
             "search_round": round_number,
             "new_results_count": len(found),
@@ -226,7 +233,8 @@ def create_graph(
 
     async def research_candidates(state: AgentState) -> dict[str, Any]:
         request = LeadRequest.model_validate(state["request"])
-        search_results = state.get("search_results", [])
+        # The shift-left stages have already rejected known CRM domains and dead hosts.
+        search_results = state.get("unprocessed_urls", state.get("search_results", []))
         semaphore = asyncio.Semaphore(settings.max_concurrency)
 
         async def research(raw: dict[str, Any]) -> Candidate:
@@ -384,9 +392,9 @@ def create_graph(
             )],
         }
 
-    async def qualify_candidates(state: AgentState) -> dict[str, Any]:
+    async def deep_qualify(state: AgentState) -> dict[str, Any]:
         request = LeadRequest.model_validate(state["request"])
-        candidates = _candidate_objects(state)
+        candidates = [c for c in _candidate_objects(state) if c.decision != Decision.DUPLICATE and c.pre_qualified is not False]
         semaphore = asyncio.Semaphore(settings.max_concurrency)
 
         async def classify_one(candidate: Candidate) -> Candidate:
@@ -402,23 +410,123 @@ def create_graph(
             })
 
         classified = await asyncio.gather(*(classify_one(candidate) for candidate in candidates))
+        classified_by_id = {c.candidate_id: c for c in classified}
+        output = [classified_by_id.get(c.candidate_id, c) for c in _candidate_objects(state)]
+        budget = current_budget()
+        llm_active = classifier.llm is not None and (
+            not settings.mock_mode or settings.llm_in_mock_mode or budget is not None
+        )
         return {
-            "candidates": _candidate_dicts(list(classified)),
-            "events": [_event("qualify_candidates", "ok", "Classified candidates using evidence-backed criteria.",
+            "candidates": _candidate_dicts(output),
+            "events": [_event("deep_qualify", "ok", "Classified pre-screened candidates using evidence-backed criteria.",
                               qualified=sum(c.decision == Decision.QUALIFIED for c in classified),
                               rejected=sum(c.decision == Decision.REJECTED for c in classified),
                               uncertain=sum(c.decision == Decision.UNCERTAIN for c in classified),
-                              classifier="LLM with structured output" if classifier.llm else "conservative deterministic fallback")],
+                              classifier="LLM with structured output and rule-based budget fallback" if llm_active and budget is not None else "LLM with structured output" if llm_active else "conservative deterministic fallback")],
         }
 
+    async def extract_directory_links(state: AgentState) -> dict[str, Any]:
+        # Directory pages are fetched once by the research adapter, which extracts only
+        # explicit outbound company website links. Those candidates return through dedup.
+        result = await research_candidates(state)
+        return {**result, "events": result.get("events", []) + [_event("extract_directory_links", "ok", "Extracted company identities and explicit website links from directory pages.")]}
+
+    async def targeted_research(state: AgentState) -> dict[str, Any]:
+        request = LeadRequest.model_validate(state["request"])
+        candidates = _candidate_objects(state)
+        pending = [c for c in candidates if c.decision == Decision.UNCERTAIN and c.confidence >= 0.50 and c.confidence <= 0.70 and c.targeted_attempts < 1]
+        semaphore = asyncio.Semaphore(settings.max_concurrency)
+        async def enrich(candidate: Candidate) -> Candidate:
+            query = f'"{candidate.company_name}" {request.region} {" ".join(candidate.missing_criteria[:2])} company'
+            try:
+                results = await search_provider.search(query, 3)
+                extra = [evidence_from_text(item.url, "targeted_search", f"{item.title}. {item.snippet}") for item in results[:3]]
+                async with semaphore:
+                    snapshot = await website_reader.fetch(candidate.website_url) if candidate.website_url else None
+                if snapshot and snapshot.text:
+                    extra.append(evidence_from_text(snapshot.final_url or candidate.website_url, "targeted_company_page", snapshot.text[:1500]))
+                return candidate.model_copy(update={"source_evidence": candidate.source_evidence + extra, "description": (candidate.description + " " + " ".join(e.excerpt for e in extra))[:2500], "targeted_attempts": candidate.targeted_attempts + 1})
+            except Exception:
+                return candidate.model_copy(update={"targeted_attempts": candidate.targeted_attempts + 1})
+        updated = {c.candidate_id: c for c in candidates}
+        for c in await asyncio.gather(*(enrich(c) for c in pending)):
+            updated[c.candidate_id] = c
+        return {"candidates": _candidate_dicts(list(updated.values())), "events": [_event("targeted_research", "ok", f"Ran bounded gap-filling research for {len(pending)} borderline candidates.")]}
+
     async def deduplicate(state: AgentState) -> dict[str, Any]:
+        # Before any page fetch, discard domains already in the CRM and URLs repeated
+        # across discovery rounds. Directory links are intentionally retained as sources.
+        pending = state.get("unprocessed_urls", state.get("search_results", []))
+        candidates = _candidate_objects(state)
+        known_domains: set[str] = set()
+        known_names: set[str] = set()
+        try:
+            for record in await crm_adapter.list_companies():
+                props = record.get("properties", {})
+                domain = normalized_domain(str(props.get("domain", record.get("domain", ""))))
+                if domain:
+                    known_domains.add(domain)
+                name = str(props.get("name", record.get("company_name", ""))).strip().lower()
+                if name:
+                    known_names.add(name)
+        except Exception:
+            # CRM lookup failure must not abort research; final upsert remains idempotent.
+            pass
+        seen = set(state.get("seen_source_urls", []))
+        filtered: list[dict[str, Any]] = []
+        duplicates = 0
+        for raw in pending:
+            url = str(raw.get("url", ""))
+            domain = normalized_domain(url)
+            title = str(raw.get("title", "")).strip().lower()
+            if canonical_url(url) in seen or (domain and domain in known_domains) or (title and title in known_names):
+                duplicates += 1
+                continue
+            seen.add(canonical_url(url))
+            filtered.append(raw)
         original = _candidate_objects(state)
         deduped = deduplicate_candidates(original)
         duplicate_count = sum(c.decision == Decision.DUPLICATE for c in deduped)
         return {
+            "unprocessed_urls": filtered,
+            "seen_source_urls": sorted(seen),
             "candidates": _candidate_dicts(deduped),
-            "events": [_event("deduplicate", "ok", f"Collapsed duplicate company identities; retained {len(deduped) - duplicate_count} canonical candidates.", duplicate_count=duplicate_count)],
+            "events": [_event("deduplicate", "ok", f"Removed {duplicates} known or repeated search results before fetching; retained {len(filtered)} new URLs.", duplicate_count=duplicates + duplicate_count)],
         }
+
+    async def fast_verify(state: AgentState) -> dict[str, Any]:
+        pending = state.get("unprocessed_urls", [])
+        semaphore = asyncio.Semaphore(settings.max_concurrency)
+        async def check(raw: dict[str, Any]) -> dict[str, Any] | None:
+            budget = current_budget()
+            if budget is not None and budget.browserbase_calls >= budget.browserbase_limit:
+                return raw
+            # Directory pages need ordinary retrieval for outbound link extraction.
+            if is_business_directory(raw.get("url", ""), raw.get("title", ""), raw.get("snippet", "")):
+                return raw
+            try:
+                async with semaphore:
+                    result = await website_reader.verify(raw["url"])
+                return raw if result.outcome == "reachable" else None
+            except Exception:
+                return None
+        checked = await asyncio.gather(*(check(raw) for raw in pending))
+        alive = [raw for raw in checked if raw is not None]
+        return {"unprocessed_urls": alive, "events": [_event("fast_verify", "ok", f"Kept {len(alive)} of {len(pending)} candidate URLs after the lightweight availability check.", discarded=len(pending)-len(alive))]}
+
+    async def cheap_filter(state: AgentState) -> dict[str, Any]:
+        # Fast, deterministic first pass over fetched titles/descriptions; the structured
+        # classifier is reserved for candidates with a plausible industry signal.
+        request = LeadRequest.model_validate(state["request"])
+        industry = {t.lower() for t in re.findall(r"[a-z0-9]+", request.industry) if len(t) > 2}
+        candidates = _candidate_objects(state)
+        passed = []
+        for candidate in candidates:
+            text = " ".join([candidate.company_name, candidate.description, candidate.raw_search_snippet]).lower()
+            hits = industry.intersection(re.findall(r"[a-z0-9]+", text))
+            prequalified = bool(hits) or not industry
+            passed.append(candidate.model_copy(update={"pre_qualified": prequalified}))
+        return {"candidates": _candidate_dicts(passed), "events": [_event("cheap_filter", "ok", f"Fast triage retained {sum(bool(getattr(c, 'pre_qualified', False)) for c in passed)} candidates for full qualification.")]}
 
     async def verify_websites(state: AgentState) -> dict[str, Any]:
         candidates = _candidate_objects(state)
@@ -477,6 +585,29 @@ def create_graph(
             return "prepare_proposal"
         return "research_candidates"
 
+    def route_after_dedup(state: AgentState) -> Literal["extract_directory_links", "fast_verify", "discover_candidates", "prepare_proposal"]:
+        request = LeadRequest.model_validate(state["request"])
+        pending = state.get("unprocessed_urls", [])
+        if pending and any(is_business_directory(r.get("url", ""), r.get("title", ""), r.get("snippet", "")) for r in pending):
+            return "extract_directory_links"
+        if pending:
+            return "fast_verify"
+        if int(state.get("search_round", 0)) < search_round_limit(request):
+            return "discover_candidates"
+        return "prepare_proposal"
+
+    def route_after_cheap_filter(state: AgentState) -> Literal["deep_qualify", "discover_candidates", "prepare_proposal"]:
+        request = LeadRequest.model_validate(state["request"])
+        if any(c.pre_qualified for c in _candidate_objects(state)):
+            return "deep_qualify"
+        return "discover_candidates" if int(state.get("search_round", 0)) < search_round_limit(request) else "prepare_proposal"
+
+    def route_after_deep_qualify(state: AgentState) -> Literal["targeted_research", "verify_websites"]:
+        candidates = _candidate_objects(state)
+        if any(c.decision == Decision.UNCERTAIN and 0.50 <= c.confidence <= 0.70 and c.targeted_attempts < 1 for c in candidates):
+            return "targeted_research"
+        return "verify_websites"
+
     def route_after_verification(state: AgentState) -> Literal["discover_candidates", "prepare_proposal"]:
         request = LeadRequest.model_validate(state["request"])
         candidates = _candidate_objects(state)
@@ -484,7 +615,7 @@ def create_graph(
             c.decision == Decision.QUALIFIED and c.website_status == WebsiteStatus.ACTIVE
             for c in candidates
         )
-        if active_qualified >= request.target_leads or int(state.get("search_round", 0)) >= settings.max_search_rounds:
+        if active_qualified >= request.target_leads or int(state.get("search_round", 0)) >= search_round_limit(request):
             return "prepare_proposal"
         return "discover_candidates"
 
@@ -698,13 +829,20 @@ def create_graph(
             notes.append("Uncertain candidates were kept visible and were not auto-imported.")
         if inactive:
             notes.append("Inactive website results were retained for audit but excluded from the import proposal.")
-        if settings.mock_mode:
+        if settings.mock_mode and not request.test_mode:
             storage_note = (
                 "CRM records were stored in memory and will be cleared when the service stops."
                 if settings.database_url.startswith("memory://")
                 else "CRM records were stored in PostgreSQL."
             )
             notes.append(f"This run used synthetic mock sources. {storage_note}")
+        if request.test_mode:
+            budget = current_budget()
+            if budget is not None:
+                notes.append(
+                    f"Low-call test mode used {budget.browserbase_calls}/{budget.browserbase_limit} Browserbase requests "
+                    f"and {budget.llm_calls}/{budget.llm_limit} LLM calls; qualification beyond the LLM cap uses rule-based evaluation."
+                )
         report = AgentReport(
             request_id=request.request_id,
             run_id=run_id,
@@ -730,9 +868,13 @@ def create_graph(
     builder = StateGraph(AgentState)
     builder.add_node("validate_input", validate_input)
     builder.add_node("discover_candidates", discover_candidates)
-    builder.add_node("research_candidates", research_candidates)
-    builder.add_node("qualify_candidates", qualify_candidates)
     builder.add_node("deduplicate", deduplicate)
+    builder.add_node("extract_directory_links", extract_directory_links)
+    builder.add_node("fast_verify", fast_verify)
+    builder.add_node("research_candidates", research_candidates)
+    builder.add_node("cheap_filter", cheap_filter)
+    builder.add_node("deep_qualify", deep_qualify)
+    builder.add_node("targeted_research", targeted_research)
     builder.add_node("verify_websites", verify_websites)
     builder.add_node("prepare_proposal", prepare_proposal)
     builder.add_node("approval_gate", approval_gate)
@@ -742,10 +884,14 @@ def create_graph(
 
     builder.add_edge(START, "validate_input")
     builder.add_edge("validate_input", "discover_candidates")
-    builder.add_conditional_edges("discover_candidates", route_after_discovery, {"research_candidates": "research_candidates", "prepare_proposal": "prepare_proposal"})
-    builder.add_edge("research_candidates", "qualify_candidates")
-    builder.add_edge("qualify_candidates", "deduplicate")
-    builder.add_edge("deduplicate", "verify_websites")
+    builder.add_edge("discover_candidates", "deduplicate")
+    builder.add_conditional_edges("deduplicate", route_after_dedup, {"extract_directory_links": "extract_directory_links", "fast_verify": "fast_verify", "discover_candidates": "discover_candidates", "prepare_proposal": "prepare_proposal"})
+    builder.add_edge("extract_directory_links", "cheap_filter")
+    builder.add_edge("fast_verify", "research_candidates")
+    builder.add_edge("research_candidates", "cheap_filter")
+    builder.add_conditional_edges("cheap_filter", route_after_cheap_filter, {"deep_qualify": "deep_qualify", "discover_candidates": "discover_candidates", "prepare_proposal": "prepare_proposal"})
+    builder.add_conditional_edges("deep_qualify", route_after_deep_qualify, {"targeted_research": "targeted_research", "verify_websites": "verify_websites"})
+    builder.add_edge("targeted_research", "deep_qualify")
     builder.add_conditional_edges("verify_websites", route_after_verification, {"discover_candidates": "discover_candidates", "prepare_proposal": "prepare_proposal"})
     builder.add_conditional_edges("prepare_proposal", route_proposal, {"approval_gate": "approval_gate", "build_report": "build_report"})
     builder.add_conditional_edges("approval_gate", route_approval, {"execute_import": "execute_import", "build_report": "build_report"})

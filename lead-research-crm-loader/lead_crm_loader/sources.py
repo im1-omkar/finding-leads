@@ -15,6 +15,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from .config import Settings
+from .call_budget import current_budget
 from .models import ContactAccess, Evidence, SearchResult, WebsiteSnapshot
 
 
@@ -156,6 +157,30 @@ class WebsiteReader(Protocol):
     async def verify(self, url: str) -> WebsiteSnapshot: ...
 
 
+class TestModeSearchProvider:
+    def __init__(self, fallback: SearchProvider, live: SearchProvider) -> None:
+        self.fallback = fallback
+        self.live = live
+
+    async def search(self, query: str, max_results: int = 20) -> list[SearchResult]:
+        provider = self.live if current_budget() is not None else self.fallback
+        return await provider.search(query, max_results)
+
+
+class TestModeWebsiteReader:
+    def __init__(self, fallback: WebsiteReader, live: WebsiteReader) -> None:
+        self.fallback = fallback
+        self.live = live
+
+    async def fetch(self, url: str) -> WebsiteSnapshot:
+        reader = self.live if current_budget() is not None else self.fallback
+        return await reader.fetch(url)
+
+    async def verify(self, url: str) -> WebsiteSnapshot:
+        reader = self.live if current_budget() is not None else self.fallback
+        return await reader.verify(url)
+
+
 class BrowserbaseSearchProvider:
     """Search with Browserbase's structured Web Search REST API."""
 
@@ -167,6 +192,9 @@ class BrowserbaseSearchProvider:
         self.mode = mode if mode in {"fast"} else "fast"
 
     async def search(self, query: str, max_results: int = 20) -> list[SearchResult]:
+        budget = current_budget()
+        if budget is not None and not budget.reserve_browserbase():
+            return []
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(
                 self.API_URL,
@@ -422,6 +450,9 @@ class BrowserbaseWebsiteReader:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             for _ in range(6):
                 await asyncio.to_thread(self._url_validator._validate_public_url, current)
+                budget = current_budget()
+                if budget is not None and not budget.reserve_browserbase():
+                    return current, None, "", "Test-mode Browserbase request budget exhausted"
                 response = await client.post(
                     self.FETCH_URL,
                     headers={"X-BB-API-Key": self.api_key},
@@ -449,6 +480,9 @@ class BrowserbaseWebsiteReader:
 
         async with self._browser_slots:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
+                budget = current_budget()
+                if budget is not None and not budget.reserve_browserbase():
+                    return None, None, None
                 response = await client.post(
                     self.SESSIONS_URL,
                     headers={"X-BB-API-Key": self.api_key},
@@ -554,19 +588,23 @@ class MockWebsiteReader:
 
 
 def build_source_adapters(settings: Settings) -> tuple[SearchProvider, WebsiteReader]:
-    if settings.mock_mode:
+    if settings.mock_mode and not settings.browserbase_api_key:
         return MockSearchProvider(settings.number_of_leads), MockWebsiteReader()
     if not settings.browserbase_api_key:
         raise RuntimeError("BROWSERBASE_API_KEY is required when MOCK_MODE=false")
-    return (
-        BrowserbaseSearchProvider(
-            settings.browserbase_api_key,
-            timeout=settings.request_timeout_seconds,
-            mode=settings.browserbase_search_mode,
-        ),
-        BrowserbaseWebsiteReader(
-            settings.browserbase_api_key,
-            timeout=settings.request_timeout_seconds,
-            max_browser_concurrency=settings.browserbase_max_concurrency,
-        ),
+    live_search = BrowserbaseSearchProvider(
+        settings.browserbase_api_key,
+        timeout=settings.request_timeout_seconds,
+        mode=settings.browserbase_search_mode,
     )
+    live_reader = BrowserbaseWebsiteReader(
+        settings.browserbase_api_key,
+        timeout=settings.request_timeout_seconds,
+        max_browser_concurrency=settings.browserbase_max_concurrency,
+    )
+    if settings.mock_mode:
+        return (
+            TestModeSearchProvider(MockSearchProvider(settings.number_of_leads), live_search),
+            TestModeWebsiteReader(MockWebsiteReader(), live_reader),
+        )
+    return live_search, live_reader

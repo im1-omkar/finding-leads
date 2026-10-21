@@ -136,7 +136,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     async def execute_local_job(job: dict[str, Any]) -> None:
         try:
-            await execute_run_job(job, app.state.graph, store)
+            await execute_run_job(job, app.state.graph, store, settings)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -161,6 +161,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def public_config() -> dict[str, Any]:
         return {
             "number_of_leads": settings.number_of_leads,
+            "test_mode_browserbase_call_limit": settings.test_mode_browserbase_call_limit,
+            "test_mode_llm_call_limit": settings.test_mode_llm_call_limit,
+            "test_mode_candidate_url_limit": settings.test_mode_candidate_url_limit,
             "mock_mode": settings.mock_mode,
             "browserbase_configured": bool(settings.browserbase_api_key),
             "llm_configured": bool(settings.llm_api_key),
@@ -252,6 +255,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def start_run(request_body: LeadRequest, request: Request) -> dict[str, Any]:
         user = await current_user(request)
         validate_csrf(request)
+        if request_body.test_mode:
+            try:
+                settings.validate_for_live_mode()
+            except RuntimeError as exc:
+                raise HTTPException(status_code=422, detail=f"Low-call test mode needs live provider credentials. {exc}") from exc
         run_id = str(uuid.uuid4())
         authoritative_request = request_body.model_copy(update={"target_leads": settings.number_of_leads})
         run_payload = authoritative_request.model_dump(mode="json")

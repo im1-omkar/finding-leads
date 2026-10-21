@@ -4,6 +4,7 @@ import re
 from typing import Iterable
 
 from .config import Settings
+from .call_budget import LLMBudgetExhausted, current_budget
 from .models import Candidate, Classification, Decision, LeadRequest
 
 STOP_WORDS = {
@@ -108,6 +109,8 @@ class LLMClassifier:
         if default_headers:
             kwargs["default_headers"] = default_headers
         self.model = ChatOpenAI(**kwargs).with_structured_output(Classification)
+        # Keep test-mode provider attempts strict by disabling the client's retries.
+        self.limited_model = ChatOpenAI(**{**kwargs, "max_retries": 0}).with_structured_output(Classification)
 
     async def classify(self, request: LeadRequest, candidate: Candidate) -> Classification:
         evidence = [
@@ -133,7 +136,13 @@ class LLMClassifier:
                 f"REQUEST: {request.model_dump_json()}\nCANDIDATE: {candidate.model_dump_json()}\nEVIDENCE: {evidence}",
             ),
         ]
-        result = await self.model.ainvoke(prompt)
+        budget = current_budget()
+        model = self.model
+        if budget is not None:
+            if not budget.reserve_llm():
+                raise LLMBudgetExhausted("Test-mode LLM call budget exhausted")
+            model = self.limited_model
+        result = await model.ainvoke(prompt)
         return result if isinstance(result, Classification) else Classification.model_validate(result)
 
 
@@ -142,7 +151,7 @@ class QualificationService:
         self.settings = settings
         self.fallback = RuleBasedClassifier(settings.min_confidence)
         self.llm = None
-        if settings.llm_api_key and (not settings.mock_mode or settings.llm_in_mock_mode):
+        if settings.llm_api_key:
             try:
                 self.llm = LLMClassifier(settings)
             except Exception:
@@ -150,10 +159,13 @@ class QualificationService:
                 self.llm = None
 
     async def classify(self, request: LeadRequest, candidate: Candidate) -> Classification:
-        if self.llm is None:
+        budget = current_budget()
+        if self.llm is None or (self.settings.mock_mode and not self.settings.llm_in_mock_mode and budget is None):
             return await self.fallback.classify(request, candidate)
         try:
             result = await self.llm.classify(request, candidate)
+        except LLMBudgetExhausted:
+            return await self.fallback.classify(request, candidate)
         except Exception:
             # Mark low-confidence rather than silently promoting a failed model call.
             return Classification(

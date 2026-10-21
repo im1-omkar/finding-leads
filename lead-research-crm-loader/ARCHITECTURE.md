@@ -32,20 +32,28 @@ The design deliberately separates **judgment** from **invariants**:
 ```mermaid
 flowchart TD
     A[Validate request] --> B[Discover sources]
-    B -->|URLs found| C[Research pages]
-    B -->|No new URLs / budget exhausted| H[Prepare proposal]
-    C --> D[Qualify with evidence]
-    D --> E[Deduplicate]
-    E --> F[Independent website check]
-    F -->|Need more qualified leads and budget remains| B
-    F -->|Target reached / budget exhausted| H
-    H -->|No eligible leads| L[Build report]
-    H -->|Eligible leads| I{Human approval interrupt}
-    I -->|Reject / invalid / stale approval| L
-    I -->|Approve selected IDs| J[Idempotent CRM writes]
-    J --> K[Read-back verification]
-    K --> L
+    B --> C[Deduplicate URLs and known CRM entities]
+    C -->|Directory source| D[Extract explicit company website links]
+    D --> G[Cheap industry triage]
+    C -->|Direct domain| E[Fast availability check]
+    E --> F[Progressive page research]
+    F --> G
+    G -->|Plausible match| H[Evidence based deep qualification]
+    G -->|No plausible match| B
+    H -->|Borderline evidence| I[One targeted research pass]
+    I --> H
+    H --> J[Independent website verification]
+    J -->|Need more leads and budget remains| B
+    J -->|Quota met or exhausted| K[Prepare hashed proposal]
+    K -->|No eligible leads| P[Build report]
+    K -->|Eligible leads| L{Human approval interrupt}
+    L -->|Reject / invalid / stale approval| P
+    L -->|Approve selected IDs| M[Idempotent CRM writes]
+    M --> N[Independent CRM read-back]
+    N --> P
 ```
+
+The current implementation performs the first triage with a deterministic title/description industry-token check. Deep qualification uses the configured structured LLM when enabled and a conservative rule-based fallback otherwise. Directory extraction is handled by the public page research node; it follows explicit outbound website links and routes resulting companies through triage. Targeted research performs at most one search pass per candidate whose deep evaluation marks it uncertain with confidence from 0.50 through 0.70.
 
 The target is a **goal, not permission to invent leads**. Search stops when enough active qualified leads are available or the configured research budget is exhausted. The report should make a shortfall visible rather than filling the target with weak or unsupported candidates.
 

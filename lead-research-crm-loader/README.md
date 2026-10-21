@@ -27,6 +27,8 @@ NUMBER_OF_LEADS=50
 
 The supported range is 1–200. This environment value is authoritative: the UI displays it and the API ignores a different target sent by a client. The workflow proposes no more than that number of active, qualified companies. In mock mode, fixtures are generated to exercise the configured count. Live search stops when it reaches the count or exhausts `MAX_CANDIDATES` / `MAX_SEARCH_ROUNDS`; it reports any substantiated shortfall instead of fabricating companies.
 
+The UI's **Low-call test mode** uses real Browserbase and LLM providers with per-run caps. Configure those caps with `TEST_MODE_BROWSERBASE_CALL_LIMIT` (default `24`), `TEST_MODE_LLM_CALL_LIMIT` (default `6`), and `TEST_MODE_MAX_CANDIDATE_URLS` (default `2`). Test mode processes one discovery round and passes at most the configured number of candidate URLs through the graph, so the pipeline stays observable without flooding the UI or exhausting its LLM budget. When the LLM cap is reached, remaining candidates use the deterministic rule-based qualifier. These settings apply only to test-mode runs; ordinary live runs are unchanged. Test mode requires both Browserbase and LLM credentials.
+
 Changing `.env` requires recreating the services so they receive the updated environment:
 
 ```bash

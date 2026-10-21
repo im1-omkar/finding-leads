@@ -50,7 +50,7 @@ async def run_worker() -> None:
                     continue
                 heartbeat = asyncio.create_task(_heartbeat(run_store, int(job["job_id"])))
                 try:
-                    await execute_run_job(job, graph, run_store)
+                    await execute_run_job(job, graph, run_store, settings)
                     await run_store.finish_job(int(job["job_id"]))
                 except Exception as exc:
                     message = f"{type(exc).__name__}: {exc}"

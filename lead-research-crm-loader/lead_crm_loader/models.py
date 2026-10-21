@@ -37,6 +37,7 @@ class LeadRequest(StrictModel):
     company_size: CompanySize = Field(default_factory=CompanySize)
     qualification_criteria: list[str] = Field(min_length=1, max_length=20)
     target_leads: int = Field(default=50, ge=1, le=200)
+    test_mode: bool = False
 
     @field_validator("request_id", "industry", "region")
     @classmethod
@@ -139,6 +140,8 @@ class Candidate(StrictModel):
     source_evidence: list[Evidence] = Field(default_factory=list)
     raw_search_snippet: str = ""
     decision: Decision = Decision.UNCERTAIN
+    pre_qualified: bool | None = None
+    targeted_attempts: int = 0
     confidence: float = 0.0
     rationale: str = "Not yet evaluated"
     matched_criteria: list[str] = Field(default_factory=list)

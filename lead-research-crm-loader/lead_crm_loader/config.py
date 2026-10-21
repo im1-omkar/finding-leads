@@ -27,6 +27,9 @@ class Settings:
     max_candidates: int = 250
     max_search_rounds: int = 3
     max_concurrency: int = 6
+    test_mode_browserbase_call_limit: int = 24
+    test_mode_llm_call_limit: int = 6
+    test_mode_candidate_url_limit: int = 2
     request_timeout_seconds: float = 12.0
     min_confidence: float = 0.70
 
@@ -62,6 +65,9 @@ class Settings:
             max_candidates=max(number_of_leads, min(int(os.getenv("MAX_CANDIDATES", "250")), 1000)),
             max_search_rounds=max(1, min(int(os.getenv("MAX_SEARCH_ROUNDS", "3")), 5)),
             max_concurrency=max(1, min(int(os.getenv("MAX_CONCURRENCY", "6")), 16)),
+            test_mode_browserbase_call_limit=max(0, min(int(os.getenv("TEST_MODE_BROWSERBASE_CALL_LIMIT", "24")), 1000)),
+            test_mode_llm_call_limit=max(0, min(int(os.getenv("TEST_MODE_LLM_CALL_LIMIT", "6")), 1000)),
+            test_mode_candidate_url_limit=max(1, min(int(os.getenv("TEST_MODE_MAX_CANDIDATE_URLS", "2")), 100)),
             request_timeout_seconds=max(2.0, float(os.getenv("REQUEST_TIMEOUT_SECONDS", "12"))),
             min_confidence=min(1.0, max(0.0, float(os.getenv("MIN_CONFIDENCE", "0.70")))),
         )
