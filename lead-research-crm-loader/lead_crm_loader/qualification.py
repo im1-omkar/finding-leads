@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import re
-from typing import Iterable
+from typing import Any
+
+import httpx
 
 from .config import Settings
 from .call_budget import LLMBudgetExhausted, current_budget
-from .models import Candidate, Classification, Decision, LeadRequest
+from .models import BatchClassification, Candidate, CandidateClassification, Classification, Decision, LeadRequest, WebsiteStatus
+from .usage import current_usage
 
 STOP_WORDS = {
     "the", "and", "for", "with", "that", "this", "from", "into", "are", "is", "in", "of", "to", "a", "an",
@@ -91,12 +96,23 @@ class LLMClassifier:
     def __init__(self, settings: Settings) -> None:
         from langchain_openai import ChatOpenAI
 
+        async def count_http_attempt(_request: httpx.Request) -> None:
+            usage = current_usage()
+            if usage is not None:
+                usage.increment("llm_http_attempts")
+
+        # The injected client observes each HTTP attempt, including SDK-managed retries.
+        self.http_client = httpx.AsyncClient(
+            timeout=settings.request_timeout_seconds,
+            event_hooks={"request": [count_http_attempt]},
+        )
         kwargs: dict[str, object] = {
             "model": settings.llm_model,
             "api_key": settings.llm_api_key,
             "temperature": 0,
             "timeout": settings.request_timeout_seconds,
             "max_retries": 2,
+            "http_async_client": self.http_client,
         }
         if settings.llm_base_url:
             kwargs["base_url"] = settings.llm_base_url
@@ -108,32 +124,54 @@ class LLMClassifier:
                 default_headers["X-Title"] = settings.openrouter_app_name
         if default_headers:
             kwargs["default_headers"] = default_headers
-        self.model = ChatOpenAI(**kwargs).with_structured_output(Classification)
+        self.model = ChatOpenAI(**kwargs).with_structured_output(BatchClassification)
         # Keep test-mode provider attempts strict by disabling the client's retries.
-        self.limited_model = ChatOpenAI(**{**kwargs, "max_retries": 0}).with_structured_output(Classification)
+        self.limited_model = ChatOpenAI(**{**kwargs, "max_retries": 0}).with_structured_output(BatchClassification)
 
-    async def classify(self, request: LeadRequest, candidate: Candidate) -> Classification:
-        evidence = [
-            {
-                "evidence_id": item.evidence_id,
-                "source_url": item.source_url,
-                "source_type": item.source_type,
-                "excerpt": item.excerpt,
-            }
-            for item in candidate.source_evidence
-        ]
+    @staticmethod
+    def _candidate_payload(candidate: Candidate) -> dict[str, Any]:
+        return {
+            "candidate_id": candidate.candidate_id,
+            "company_name": candidate.company_name,
+            "legal_name": candidate.legal_name,
+            "domain": candidate.domain,
+            "website_status": candidate.website_status,
+            "employee_count": candidate.employee_count,
+            "description": candidate.description[:1000],
+            "raw_search_snippet": candidate.raw_search_snippet[:500],
+            "evidence": [
+                {
+                    "evidence_id": item.evidence_id,
+                    "source_url": item.source_url,
+                    "source_type": item.source_type,
+                    "excerpt": item.excerpt[:600],
+                }
+                for item in candidate.source_evidence[:3]
+            ],
+        }
+
+    async def classify_many(
+        self, request: LeadRequest, candidates: list[Candidate]
+    ) -> list[CandidateClassification]:
         prompt = [
             (
                 "system",
-                """You are a conservative B2B company-qualification engine. Use only the supplied public evidence. """
+                """You are a conservative B2B company-qualification engine. Evaluate every supplied company independently. """
+                "Never mix facts or evidence between companies. Use only the evidence attached to that candidate. """
                 "Never infer missing location, employee count, products, or legal identity. Do not use an inaccessible contact page as evidence. """
                 "Choose qualified only when evidence supports the industry, region, every material qualification criterion, and any specified size range. """
-                "Choose rejected only when evidence contradicts a material criterion; choose uncertain when evidence is missing/ambiguous. """
-                "Return short, auditable reasons; include exact evidence_ids from the supplied list that support the decision."
+                "Choose rejected only when evidence contradicts a material criterion; choose uncertain when evidence is missing or ambiguous. """
+                "For qualified results, cite evidence that directly supports the region and every material criterion, including at least one company_website record. "
+                "When a criterion requires products, platforms, SaaS, or tools, the official company_website evidence itself must show the relevant AI/software offering; do not rely on a listicle or a search snippet. "
+                "Return exactly one classification for each candidate_id. Include only exact evidence_ids supplied for that same candidate."
             ),
             (
                 "human",
-                f"REQUEST: {request.model_dump_json()}\nCANDIDATE: {candidate.model_dump_json()}\nEVIDENCE: {evidence}",
+                "REQUEST: " + request.model_dump_json() + "\nCANDIDATES: " + json.dumps(
+                    [self._candidate_payload(candidate) for candidate in candidates],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
             ),
         ]
         budget = current_budget()
@@ -142,8 +180,16 @@ class LLMClassifier:
             if not budget.reserve_llm():
                 raise LLMBudgetExhausted("Test-mode LLM call budget exhausted")
             model = self.limited_model
+        usage = current_usage()
+        if usage is not None:
+            usage.increment("llm_batch_calls")
         result = await model.ainvoke(prompt)
-        return result if isinstance(result, Classification) else Classification.model_validate(result)
+        batch = result if isinstance(result, BatchClassification) else BatchClassification.model_validate(result)
+        return batch.classifications
+
+    async def classify(self, request: LeadRequest, candidate: Candidate) -> Classification:
+        results = await self.classify_many(request, [candidate])
+        return results[0]
 
 
 class QualificationService:
@@ -158,26 +204,74 @@ class QualificationService:
                 # An unavailable optional provider must not prevent the mock demo from starting.
                 self.llm = None
 
-    async def classify(self, request: LeadRequest, candidate: Candidate) -> Classification:
+    async def classify_many(self, request: LeadRequest, candidates: list[Candidate]) -> dict[str, Classification]:
         budget = current_budget()
         if self.llm is None or (self.settings.mock_mode and not self.settings.llm_in_mock_mode and budget is None):
-            return await self.fallback.classify(request, candidate)
+            fallback_results = await asyncio.gather(*(self.fallback.classify(request, candidate) for candidate in candidates))
+            return {candidate.candidate_id: result for candidate, result in zip(candidates, fallback_results)}
         try:
-            result = await self.llm.classify(request, candidate)
+            raw_results = await self.llm.classify_many(request, candidates)
         except LLMBudgetExhausted:
-            return await self.fallback.classify(request, candidate)
+            fallback_results = await asyncio.gather(*(self.fallback.classify(request, candidate) for candidate in candidates))
+            return {candidate.candidate_id: result for candidate, result in zip(candidates, fallback_results)}
         except Exception:
             # Mark low-confidence rather than silently promoting a failed model call.
-            return Classification(
-                decision=Decision.UNCERTAIN,
-                confidence=0.20,
-                rationale="LLM classification failed; candidate requires manual review.",
-                missing_criteria=request.qualification_criteria,
-                evidence_ids=[e.evidence_id for e in candidate.source_evidence],
-            )
+            return {
+                candidate.candidate_id: self._uncertain(request, candidate, "LLM batch classification failed; candidate requires manual review.")
+                for candidate in candidates
+            }
 
+        by_id: dict[str, CandidateClassification | None] = {}
+        duplicate_ids: set[str] = set()
+        valid_candidate_ids = {candidate.candidate_id for candidate in candidates}
+        for result in raw_results:
+            if result.candidate_id not in valid_candidate_ids:
+                continue
+            if result.candidate_id in by_id:
+                duplicate_ids.add(result.candidate_id)
+            by_id[result.candidate_id] = result
+
+        output: dict[str, Classification] = {}
+        for candidate in candidates:
+            result = by_id.get(candidate.candidate_id)
+            if result is None or candidate.candidate_id in duplicate_ids:
+                output[candidate.candidate_id] = self._uncertain(
+                    request, candidate, "LLM batch omitted or duplicated this candidate; manual review is required."
+                )
+            else:
+                output[candidate.candidate_id] = self._validate_result(request, candidate, result)
+        return output
+
+    async def classify(self, request: LeadRequest, candidate: Candidate) -> Classification:
+        return (await self.classify_many(request, [candidate]))[candidate.candidate_id]
+
+    @staticmethod
+    def _uncertain(request: LeadRequest, candidate: Candidate, rationale: str) -> Classification:
+        return Classification(
+            decision=Decision.UNCERTAIN,
+            confidence=0.20,
+            rationale=rationale,
+            missing_criteria=request.qualification_criteria,
+            evidence_ids=[e.evidence_id for e in candidate.source_evidence],
+        )
+
+    def _validate_result(
+        self, request: LeadRequest, candidate: Candidate, result: Classification
+    ) -> Classification:
         valid_ids = {e.evidence_id for e in candidate.source_evidence}
         cited_ids = [value for value in result.evidence_ids if value in valid_ids]
+        cited_text = " ".join(
+            evidence.excerpt
+            for evidence in candidate.source_evidence
+            if evidence.evidence_id in cited_ids
+        ).lower()
+        official_cited_text = " ".join(
+            evidence.excerpt
+            for evidence in candidate.source_evidence
+            if evidence.evidence_id in cited_ids and evidence.source_type == "company_website"
+        ).lower()
+        evidence_tokens = set(re.findall(r"[a-zA-Z0-9]+", cited_text))
+        official_tokens = set(re.findall(r"[a-zA-Z0-9]+", official_cited_text))
         # Enforce numeric constraints in ordinary code; don't let a model infer employee count.
         size = request.company_size
         size_requested = size.min_employees is not None or size.max_employees is not None
@@ -199,4 +293,48 @@ class QualificationService:
                 "rationale": "Model qualification lacked sufficient confidence or valid evidence citations.",
                 "evidence_ids": cited_ids,
             })
+        if result.decision == Decision.QUALIFIED:
+            unsupported: list[str] = []
+            industry_tokens = tokens(request.industry)
+            if industry_tokens and not industry_tokens.intersection(evidence_tokens):
+                unsupported.append(f"Industry evidence for {request.industry}")
+            if request.region and request.region.lower() not in cited_text:
+                unsupported.append(f"Location evidence for {request.region}")
+            if request.region and official_cited_text and request.region.lower() not in official_cited_text:
+                unsupported.append(f"Location evidence for {request.region} on the official website")
+            if not candidate.domain or not candidate.website_url or candidate.website_status != WebsiteStatus.ACTIVE:
+                unsupported.append("An active official company website")
+            if not any(e.source_type == "company_website" and e.evidence_id in cited_ids for e in candidate.source_evidence):
+                unsupported.append("Evidence from the official company website")
+
+            for criterion in request.qualification_criteria:
+                lowered = criterion.lower()
+                if any(signal in lowered for signal in ("website", "official", "active")):
+                    continue
+                if any(signal in lowered for signal in ("based", "located", "headquartered")) or request.region.lower() in lowered:
+                    continue
+                criterion_tokens = tokens(criterion)
+                coverage = len(criterion_tokens.intersection(evidence_tokens)) / max(1, len(criterion_tokens))
+                if coverage < 0.35:
+                    unsupported.append(f"Evidence for criterion: {criterion}")
+                if re.search(r"\b(products?|platforms?|saas|tools?)\b", lowered) and not re.search(
+                    r"\b(products?|platforms?|saas|tools?)\b", cited_text
+                ):
+                    unsupported.append(f"Evidence of a product or platform for criterion: {criterion}")
+                if re.search(r"\b(products?|platforms?|saas|tools?)\b", lowered):
+                    official_product = re.search(r"\b(products?|platforms?|saas|tools?)\b", official_cited_text)
+                    official_industry = tokens(request.industry).intersection(official_tokens)
+                    if not official_product or not official_industry:
+                        unsupported.append(
+                            f"Official-site evidence of an AI/software product or platform for criterion: {criterion}"
+                        )
+
+            if unsupported:
+                return result.model_copy(update={
+                    "decision": Decision.UNCERTAIN,
+                    "confidence": min(result.confidence, 0.68),
+                    "rationale": "The cited public evidence does not substantiate every required criterion: " + "; ".join(dict.fromkeys(unsupported)) + ".",
+                    "missing_criteria": list(dict.fromkeys(result.missing_criteria + unsupported)),
+                    "evidence_ids": cited_ids,
+                })
         return result.model_copy(update={"evidence_ids": cited_ids})

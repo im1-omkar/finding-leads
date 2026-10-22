@@ -6,6 +6,14 @@ from collections import defaultdict
 from .models import Candidate, Decision
 from .sources import normalized_domain
 
+"""
+Acme Pvt Ltd and Acme Limited → duplicate ======> duplicate will be find
+
+Acme AI and Acme Artificial Intelligence → not detected  ========> duplicate cannot be found
+
+to make it more better we need some LLM calls for this
+"""
+
 LEGAL_SUFFIXES = {
     "private", "limited", "pvt", "ltd", "inc", "incorporated", "llc", "llp", "corp", "corporation",
     "company", "co", "plc", "gmbh", "sarl", "sa", "bv", "pty",
@@ -97,3 +105,4 @@ def deduplicate_candidates(candidates: list[Candidate]) -> list[Candidate]:
     discovery_index = {c.candidate_id: i for i, c in enumerate(candidates)}
     output.sort(key=lambda c: discovery_index.get(c.candidate_id, 10**9))
     return output
+    

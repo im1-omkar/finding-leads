@@ -164,6 +164,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "test_mode_browserbase_call_limit": settings.test_mode_browserbase_call_limit,
             "test_mode_llm_call_limit": settings.test_mode_llm_call_limit,
             "test_mode_candidate_url_limit": settings.test_mode_candidate_url_limit,
+            "llm_batch_size": settings.llm_batch_size,
+            "max_targeted_searches_per_run": settings.max_targeted_searches_per_run,
             "mock_mode": settings.mock_mode,
             "browserbase_configured": bool(settings.browserbase_api_key),
             "llm_configured": bool(settings.llm_api_key),

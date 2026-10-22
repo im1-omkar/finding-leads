@@ -17,6 +17,7 @@ from bs4 import BeautifulSoup
 from .config import Settings
 from .call_budget import current_budget
 from .models import ContactAccess, Evidence, SearchResult, WebsiteSnapshot
+from .usage import current_usage
 
 
 def utc_iso() -> str:
@@ -66,6 +67,17 @@ BLOCKED_OFFICIAL_LINK_HOSTS = (
     "facebook.com", "instagram.com", "x.com", "twitter.com", "youtube.com", "tiktok.com", "wa.me",
     "whatsapp.com", "google.com", "maps.google.com", *DIRECTORY_DOMAIN_HINTS,
 )
+EDITORIAL_PATH_HINTS = ("/blog/", "/insights/", "/news/", "/articles/", "/resources/")
+LISTICLE_TITLE_RE = re.compile(r"^(?:top\s+\d+|best\s+\d+|list\s+of\b|\d+\s+(?:best|top)\b)", re.I)
+
+
+def is_editorial_listicle(url: str, title: str, snippet: str = "") -> bool:
+    """Identify listicle search hits that describe a market, not the company itself."""
+    path = urlparse(url).path.lower()
+    if not any(hint in f"{path.rstrip('/')}/" for hint in EDITORIAL_PATH_HINTS):
+        return False
+    headline = " ".join([title, snippet]).strip()
+    return bool(LISTICLE_TITLE_RE.search(headline))
 
 
 def is_business_directory(url: str, title: str = "", snippet: str = "", page_text: str = "") -> bool:
@@ -186,29 +198,58 @@ class BrowserbaseSearchProvider:
 
     API_URL = "https://api.browserbase.com/v1/search"
 
-    def __init__(self, api_key: str, timeout: float = 30.0, mode: str = "fast") -> None:
+    def __init__(
+        self,
+        api_key: str,
+        timeout: float = 30.0,
+        mode: str = "fast",
+        max_concurrency: int = 1,
+    ) -> None:
         self.api_key = api_key
         self.timeout = timeout
         self.mode = mode if mode in {"fast"} else "fast"
+        self._slots = asyncio.Semaphore(max(1, max_concurrency))
 
     async def search(self, query: str, max_results: int = 20) -> list[SearchResult]:
         budget = current_budget()
-        if budget is not None and not budget.reserve_browserbase():
-            return []
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
-                self.API_URL,
-                headers={"X-BB-API-Key": self.api_key},
-                json={"provider": "parallel", "query": query[:200], "mode": self.mode, "numResults": min(max_results, 25)},
-            )
-            response.raise_for_status()
-            body = response.json()
+        usage = current_usage()
+        async with self._slots:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                body: dict[str, Any] | None = None
+                for attempt in range(3):
+                    if budget is not None and not budget.reserve_browserbase():
+                        return []
+                    if usage is not None:
+                        usage.increment("browserbase_search_requests")
+                    try:
+                        response = await client.post(
+                            self.API_URL,
+                            headers={"X-BB-API-Key": self.api_key},
+                            json={"provider": "parallel", "query": query[:200], "mode": self.mode, "numResults": min(max_results, 25)},
+                        )
+                        response.raise_for_status()
+                        body = response.json()
+                        break
+                    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout):
+                        if attempt == 2:
+                            raise
+                        await asyncio.sleep(0.4 * (2 ** attempt))
+                if body is None:
+                    return []
         output: list[SearchResult] = []
         for item in body.get("results", []):
             url = item.get("url")
             if not url:
                 continue
-            extra = " ".join(filter(None, [item.get("author"), item.get("publishedDate")]))
+            description = next(
+                (
+                    item.get(key)
+                    for key in ("snippet", "description", "summary", "text", "content")
+                    if isinstance(item.get(key), str) and item.get(key).strip()
+                ),
+                "",
+            )
+            extra = " ".join(filter(None, [description, item.get("author"), item.get("publishedDate")]))
             output.append(
                 SearchResult(
                     title=(item.get("title") or normalized_domain(url))[:240],
@@ -365,6 +406,9 @@ class PublicWebsiteReader:
             outcome = "unknown"
 
         soup = BeautifulSoup(html or "", "html.parser")
+        script_app = bool(soup.find("div", id=re.compile(r"^(root|app|__next)$")))
+        raw_text = " ".join(soup.get_text(" ", strip=True).split())
+        render_candidate = len(raw_text) < 180 and (script_app or bool(soup.find("script")))
         title = soup.title.get_text(" ", strip=True) if soup.title else ""
         h1_tag = soup.find("h1")
         h1 = h1_tag.get_text(" ", strip=True) if h1_tag else ""
@@ -394,6 +438,16 @@ class PublicWebsiteReader:
         login_indicators = ["sign in to continue", "log in to view", "authentication required", "please log in", "login required"]
         if any(marker in lowered for marker in login_indicators) and contact_access != ContactAccess.PUBLIC:
             contact_access = ContactAccess.SKIPPED_REQUIRES_LOGIN
+        challenge_indicators = [
+            "captcha", "verify you are human", "verify that you are human", "checking your browser",
+            "security check", "unusual traffic", "access denied", "robot check",
+        ]
+        needs_browser = (
+            render_candidate
+            and outcome == "reachable"
+            and contact_access != ContactAccess.SKIPPED_REQUIRES_LOGIN
+            and not any(marker in lowered for marker in challenge_indicators)
+        )
         return WebsiteSnapshot(
             requested_url=url,
             final_url=final_url,
@@ -407,9 +461,13 @@ class PublicWebsiteReader:
             outcome=outcome,
             error=error,
             contact_access=contact_access,
+            needs_browser=needs_browser,
         )
 
     async def fetch(self, url: str) -> WebsiteSnapshot:
+        usage = current_usage()
+        if usage is not None:
+            usage.increment("direct_fetch_requests")
         try:
             final_url, status, html, error = await self._request(url)
             return self._parse(url, final_url, status, html, error)
@@ -453,6 +511,9 @@ class BrowserbaseWebsiteReader:
                 budget = current_budget()
                 if budget is not None and not budget.reserve_browserbase():
                     return current, None, "", "Test-mode Browserbase request budget exhausted"
+                usage = current_usage()
+                if usage is not None:
+                    usage.increment("browserbase_fetch_requests")
                 response = await client.post(
                     self.FETCH_URL,
                     headers={"X-BB-API-Key": self.api_key},
@@ -483,6 +544,9 @@ class BrowserbaseWebsiteReader:
                 budget = current_budget()
                 if budget is not None and not budget.reserve_browserbase():
                     return None, None, None
+                usage = current_usage()
+                if usage is not None:
+                    usage.increment("browserbase_session_requests")
                 response = await client.post(
                     self.SESSIONS_URL,
                     headers={"X-BB-API-Key": self.api_key},
@@ -530,8 +594,80 @@ class BrowserbaseWebsiteReader:
             ) else "unknown"
             return WebsiteSnapshot(requested_url=url, status_code=None, outcome=outcome, error=message)
 
+    async def render(self, url: str) -> WebsiteSnapshot:
+        """Render a URL already identified as a JS shell without a redundant raw fetch."""
+        try:
+            # Validate before asking Browserbase to open the URL. The page route below
+            # validates redirects and subresource requests as well.
+            await asyncio.to_thread(self._url_validator._validate_public_url, url)
+            final_url, status, html = await self._fetch_in_browser(url)
+            if not html:
+                return WebsiteSnapshot(
+                    requested_url=url,
+                    final_url=final_url,
+                    status_code=status,
+                    outcome="unknown",
+                    error="Browserbase returned no rendered page content",
+                )
+            return PublicWebsiteReader._parse(url, final_url, status, html, None)
+        except (ValueError, RuntimeError, httpx.HTTPError, KeyError) as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            outcome = "inactive" if "DNS resolution failed" in message and any(
+                phrase in message.lower()
+                for phrase in ["name or service not known", "nodename nor servname", "no address associated", "nxdomain"]
+            ) else "unknown"
+            return WebsiteSnapshot(requested_url=url, status_code=None, outcome=outcome, error=message)
+
     async def verify(self, url: str) -> WebsiteSnapshot:
         return await self.fetch(url)
+
+
+class HybridWebsiteReader:
+    """Fetch directly first and render only reachable JavaScript shells with Browserbase."""
+
+    def __init__(self, direct: WebsiteReader, browserbase: WebsiteReader) -> None:
+        self.direct = direct
+        self.browserbase = browserbase
+
+    @staticmethod
+    def _direct_network_failure(snapshot: WebsiteSnapshot) -> bool:
+        if snapshot.outcome != "unknown":
+            return False
+        error = (snapshot.error or "").lower()
+        return (
+            error.startswith(("dns resolution failed", "transport_error:", "timeout:"))
+            or snapshot.status_code in {500, 502, 503, 504}
+        )
+
+    async def fetch(self, url: str) -> WebsiteSnapshot:
+        direct_snapshot = await self.direct.fetch(url)
+        if self._direct_network_failure(direct_snapshot):
+            try:
+                return await self.browserbase.fetch(url)
+            except Exception:
+                return direct_snapshot
+        if direct_snapshot.outcome != "reachable" or not direct_snapshot.needs_browser:
+            return direct_snapshot
+        try:
+            render = getattr(self.browserbase, "render", None)
+            rendered = await render(url) if callable(render) else await self.browserbase.fetch(url)
+        except Exception:
+            return direct_snapshot
+        if rendered.outcome == "reachable" and len(rendered.text) > len(direct_snapshot.text):
+            return rendered
+        return direct_snapshot
+
+    async def verify(self, url: str) -> WebsiteSnapshot:
+        # Availability checks are independent of discovery. If direct HTTP is unavailable
+        # at the network layer, use Browserbase Fetch as a fallback instead of marking a
+        # live site unknown solely because this runtime cannot resolve or reach it.
+        direct_snapshot = await self.direct.verify(url)
+        if not self._direct_network_failure(direct_snapshot):
+            return direct_snapshot
+        try:
+            return await self.browserbase.verify(url)
+        except Exception:
+            return direct_snapshot
 
 
 class MockWebsiteReader:
@@ -596,11 +732,16 @@ def build_source_adapters(settings: Settings) -> tuple[SearchProvider, WebsiteRe
         settings.browserbase_api_key,
         timeout=settings.request_timeout_seconds,
         mode=settings.browserbase_search_mode,
+        max_concurrency=settings.browserbase_max_concurrency,
     )
-    live_reader = BrowserbaseWebsiteReader(
+    browserbase_reader = BrowserbaseWebsiteReader(
         settings.browserbase_api_key,
         timeout=settings.request_timeout_seconds,
         max_browser_concurrency=settings.browserbase_max_concurrency,
+    )
+    live_reader = HybridWebsiteReader(
+        PublicWebsiteReader(timeout=settings.request_timeout_seconds),
+        browserbase_reader,
     )
     if settings.mock_mode:
         return (

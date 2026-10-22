@@ -53,7 +53,9 @@ flowchart TD
     N --> P
 ```
 
-The current implementation performs the first triage with a deterministic title/description industry-token check. Deep qualification uses the configured structured LLM when enabled and a conservative rule-based fallback otherwise. Directory extraction is handled by the public page research node; it follows explicit outbound website links and routes resulting companies through triage. Targeted research performs at most one search pass per candidate whose deep evaluation marks it uncertain with confidence from 0.50 through 0.70.
+The first triage uses a deterministic title/description industry-token check. Deep qualification batches up to `LLM_BATCH_SIZE` candidates per structured LLM request and records an evidence fingerprint on each classified candidate; later search rounds only classify new candidates, while targeted research reclassifies only candidates whose evidence changed. A malformed, incomplete, or cross-candidate batch result cannot promote a candidate without valid evidence IDs.
+
+Directory extraction follows only explicit outbound company website links. Targeted research is capped by `MAX_TARGETED_SEARCHES_PER_RUN` per run (default 40), prioritizing active sites and higher-confidence borderline candidates. Public pages are fetched directly over HTTP and parsed for text and links. Browserbase Fetch is a fallback when direct network access fails; a short-lived browser session is used for reachable JavaScript shells. Availability checks run directly first and use Browserbase only after network-level failures. Login, CAPTCHA, and access-denied pages are not retried through the browser renderer.
 
 The target is a **goal, not permission to invent leads**. Search stops when enough active qualified leads are available or the configured research budget is exhausted. The report should make a shortfall visible rather than filling the target with weak or unsupported candidates.
 
@@ -89,12 +91,12 @@ The current API has no reviewer authentication. It binds approval to a proposal 
 ## Adapters
 
 - `SearchProvider`: Browserbase Web Search in live mode; deterministic synthetic results in mock mode.
-- `WebsiteReader`: Browserbase Fetch in live mode, with a short-lived remote Playwright session for JavaScript-only pages; canned pages in mock mode.
-- `QualificationService`: optional structured-output LLM with conservative rule-based fallback for offline demos.
+- `WebsiteReader`: direct HTTP fetch and BeautifulSoup extraction in live mode, with Browserbase Fetch as a network-failure fallback and a short-lived Playwright session for detected JavaScript shells; canned pages in mock mode.
+- `QualificationService`: batched structured-output LLM with evidence validation and conservative rule-based fallback for offline demos or exhausted test-mode budgets.
 - `CRMAdapter`: PostgreSQL CRM in application runs; in-memory adapter in offline tests and when `DATABASE_URL=memory://`.
 - `RunStore`: PostgreSQL-backed run/event/job tables for Compose deployments; in-memory run state for local API-only mode.
 
-The adapters can be replaced without changing graph control flow. LangGraph tracing can be enabled with `LANGSMITH_TRACING=true` and a LangSmith key.
+The adapters can be replaced without changing graph control flow. Completed reports include per-run direct-fetch, Browserbase, and LLM batch/retry counts. LangGraph tracing can be enabled with `LANGSMITH_TRACING=true` and a LangSmith key.
 
 ## Known production gaps
 

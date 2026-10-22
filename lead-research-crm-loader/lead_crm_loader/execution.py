@@ -5,6 +5,7 @@ from typing import Any
 from langgraph.types import Command
 from .call_budget import RunCallBudget, reset_budget, set_budget
 from .config import Settings
+from .usage import RunUsage, reset_usage, set_usage
 
 
 async def execute_run_job(job: dict[str, Any], graph: Any, store: Any, settings: Settings | None = None) -> None:
@@ -32,6 +33,7 @@ async def execute_run_job(job: dict[str, Any], graph: Any, store: Any, settings:
             llm_limit=settings.test_mode_llm_call_limit,
         )
     budget_token = set_budget(budget)
+    usage_token = set_usage(RunUsage())
     try:
         async for update in graph.astream(graph_input, config=config, stream_mode="updates"):
             for node_update in update.values():
@@ -54,6 +56,7 @@ async def execute_run_job(job: dict[str, Any], graph: Any, store: Any, settings:
             })
     finally:
         reset_budget(budget_token)
+        reset_usage(usage_token)
 
     snapshot = await graph.aget_state(config)
     values = snapshot.values or {}

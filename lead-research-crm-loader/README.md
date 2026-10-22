@@ -22,12 +22,14 @@ Use `docker compose logs -f backend worker frontend` to inspect application logs
 Set `NUMBER_OF_LEADS` in `lead-research-crm-loader/.env`:
 
 ```dotenv
-NUMBER_OF_LEADS=50
+NUMBER_OF_LEADS=20
 ```
 
 The supported range is 1–200. This environment value is authoritative: the UI displays it and the API ignores a different target sent by a client. The workflow proposes no more than that number of active, qualified companies. In mock mode, fixtures are generated to exercise the configured count. Live search stops when it reaches the count or exhausts `MAX_CANDIDATES` / `MAX_SEARCH_ROUNDS`; it reports any substantiated shortfall instead of fabricating companies.
 
-The UI's **Low-call test mode** uses real Browserbase and LLM providers with per-run caps. Configure those caps with `TEST_MODE_BROWSERBASE_CALL_LIMIT` (default `24`), `TEST_MODE_LLM_CALL_LIMIT` (default `6`), and `TEST_MODE_MAX_CANDIDATE_URLS` (default `2`). Test mode processes one discovery round and passes at most the configured number of candidate URLs through the graph, so the pipeline stays observable without flooding the UI or exhausting its LLM budget. When the LLM cap is reached, remaining candidates use the deterministic rule-based qualifier. These settings apply only to test-mode runs; ordinary live runs are unchanged. Test mode requires both Browserbase and LLM credentials.
+The UI's test mode uses real Browserbase and LLM providers with per-run caps. Configure those caps with `TEST_MODE_BROWSERBASE_CALL_LIMIT` (default `120`), `TEST_MODE_LLM_CALL_LIMIT` (default `40`), and `TEST_MODE_MAX_CANDIDATE_URLS` (default `30`). Test mode processes one discovery round and passes at most the configured number of candidate URLs through the graph. When the LLM cap is reached, remaining candidates use the deterministic rule-based qualifier. These settings apply only to test-mode runs; ordinary live runs have no per-run provider-call cap. Test mode requires both Browserbase and LLM credentials.
+
+Live qualification batches up to `LLM_BATCH_SIZE` companies per model request (default `25`) and reclassifies a candidate only when its evidence changes. Targeted external searches are limited by `MAX_TARGETED_SEARCHES_PER_RUN` (default `40`). Discovery can process up to `MAX_CANDIDATES` (default `500`) over `MAX_SEARCH_ROUNDS` (default `10`), using distinct query pairs each round. These settings provide room to reach the configured target while keeping qualification batched; the LLM batch count is shown in the completed run report.
 
 Changing `.env` requires recreating the services so they receive the updated environment:
 
@@ -79,7 +81,7 @@ LANGSMITH_API_KEY=
 LANGSMITH_PROJECT=lead-research-crm-loader
 ```
 
-Browserbase supplies web search and public-page fetches. OpenRouter supplies structured lead qualification. `OPENAI_API_KEY` or `LLM_API_KEY` can be used instead of `OPENROUTER_API_KEY`; set `LLM_BASE_URL` and `LLM_MODEL` when your provider/model requires an explicit choice. Mock runs use the deterministic classifier by default—even if a model key is present—so synthetic fixtures stay predictable; set `LLM_IN_MOCK_MODE=true` to call the model in mock mode. LangSmith tracing is optional; set `LANGSMITH_TRACING=true` and provide its API key to enable it. Do not put credentials in source control.
+Browserbase supplies web search and selective page retrieval. Public pages are fetched directly over HTTP and parsed with BeautifulSoup first; Browserbase Fetch is used if direct network access fails, and a short-lived Browserbase browser session is used only when a reachable page looks like an unrendered JavaScript shell. Availability checks are direct and fall back to Browserbase only for network-level failures. OpenRouter supplies structured lead qualification. `OPENAI_API_KEY` or `LLM_API_KEY` can be used instead of `OPENROUTER_API_KEY`; set `LLM_BASE_URL` and `LLM_MODEL` when your provider/model requires an explicit choice. Mock runs use the deterministic classifier by default—even if a model key is present—so synthetic fixtures stay predictable; set `LLM_IN_MOCK_MODE=true` to call the model in mock mode. LangSmith tracing is optional; set `LANGSMITH_TRACING=true` and provide its API key to enable it. Do not put credentials in source control.
 
 The website reader only follows public HTTP(S) destinations and uses no credentials to access websites. It does not bypass logins, CAPTCHA, or OTP. Source or model failures keep records uncertain rather than promoting unsupported leads. Live search cannot guarantee the target when the requested market has fewer qualifying public companies or the configured research budget is exhausted.
 

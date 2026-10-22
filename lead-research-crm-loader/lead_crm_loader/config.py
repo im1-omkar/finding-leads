@@ -23,13 +23,15 @@ class Settings:
     langsmith_api_key: str | None = None
     langsmith_project: str = "lead-research-crm-loader"
     database_url: str = "postgresql://postgres:postgres@localhost:5432/lead_crm_loader"
-    number_of_leads: int = 50
-    max_candidates: int = 250
-    max_search_rounds: int = 3
+    number_of_leads: int = 20
+    max_candidates: int = 500
+    max_search_rounds: int = 10
     max_concurrency: int = 6
-    test_mode_browserbase_call_limit: int = 24
-    test_mode_llm_call_limit: int = 6
-    test_mode_candidate_url_limit: int = 2
+    llm_batch_size: int = 25
+    max_targeted_searches_per_run: int = 40
+    test_mode_browserbase_call_limit: int = 120
+    test_mode_llm_call_limit: int = 40
+    test_mode_candidate_url_limit: int = 30
     request_timeout_seconds: float = 12.0
     min_confidence: float = 0.70
 
@@ -44,7 +46,7 @@ class Settings:
             base_url = "https://openrouter.ai/api/v1"
         default_model = "openai/gpt-4o-mini" if base_url and "openrouter.ai" in base_url else "gpt-4.1-mini"
         database_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/lead_crm_loader")
-        number_of_leads = max(1, min(int(os.getenv("NUMBER_OF_LEADS", "50")), 200))
+        number_of_leads = max(1, min(int(os.getenv("NUMBER_OF_LEADS", "20")), 200))
         return cls(
             mock_mode=mock_mode,
             llm_api_key=llm_key,
@@ -62,12 +64,14 @@ class Settings:
             langsmith_project=os.getenv("LANGSMITH_PROJECT", "lead-research-crm-loader"),
             database_url=database_url,
             number_of_leads=number_of_leads,
-            max_candidates=max(number_of_leads, min(int(os.getenv("MAX_CANDIDATES", "250")), 1000)),
-            max_search_rounds=max(1, min(int(os.getenv("MAX_SEARCH_ROUNDS", "3")), 5)),
+            max_candidates=max(number_of_leads, min(int(os.getenv("MAX_CANDIDATES", "500")), 1000)),
+            max_search_rounds=max(1, min(int(os.getenv("MAX_SEARCH_ROUNDS", "10")), 10)),
             max_concurrency=max(1, min(int(os.getenv("MAX_CONCURRENCY", "6")), 16)),
-            test_mode_browserbase_call_limit=max(0, min(int(os.getenv("TEST_MODE_BROWSERBASE_CALL_LIMIT", "24")), 1000)),
-            test_mode_llm_call_limit=max(0, min(int(os.getenv("TEST_MODE_LLM_CALL_LIMIT", "6")), 1000)),
-            test_mode_candidate_url_limit=max(1, min(int(os.getenv("TEST_MODE_MAX_CANDIDATE_URLS", "2")), 100)),
+            llm_batch_size=max(1, min(int(os.getenv("LLM_BATCH_SIZE", "25")), 50)),
+            max_targeted_searches_per_run=max(0, min(int(os.getenv("MAX_TARGETED_SEARCHES_PER_RUN", "40")), 1000)),
+            test_mode_browserbase_call_limit=max(0, min(int(os.getenv("TEST_MODE_BROWSERBASE_CALL_LIMIT", "120")), 1000)),
+            test_mode_llm_call_limit=max(0, min(int(os.getenv("TEST_MODE_LLM_CALL_LIMIT", "40")), 1000)),
+            test_mode_candidate_url_limit=max(1, min(int(os.getenv("TEST_MODE_MAX_CANDIDATE_URLS", "30")), 100)),
             request_timeout_seconds=max(2.0, float(os.getenv("REQUEST_TIMEOUT_SECONDS", "12"))),
             min_confidence=min(1.0, max(0.0, float(os.getenv("MIN_CONFIDENCE", "0.70")))),
         )

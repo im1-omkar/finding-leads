@@ -26,6 +26,8 @@ from .models import (
     Decision,
     ImportStatus,
     LeadRequest,
+    RunUsageSummary,
+    WebsiteSnapshot,
     WebsiteStatus,
 )
 from .qualification import QualificationService
@@ -37,10 +39,12 @@ from .sources import (
     evidence_from_text,
     find_official_website_link,
     is_business_directory,
+    is_editorial_listicle,
     normalized_domain,
     stable_id,
     site_root,
 )
+from .usage import current_usage, merge_usage, usage_delta
 
 
 class AgentState(TypedDict, total=False):
@@ -49,6 +53,8 @@ class AgentState(TypedDict, total=False):
     search_results: list[dict[str, Any]]
     seen_urls: list[str]
     search_round: int
+    targeted_searches_used: int
+    usage: Annotated[dict[str, int], merge_usage]
     new_results_count: int
     unprocessed_urls: list[dict[str, Any]]
     candidates: list[dict[str, Any]]
@@ -115,6 +121,46 @@ def _proposal_digest(candidate_ids: list[str], candidates: list[Candidate]) -> s
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+def _candidate_evidence_hash(candidate: Candidate) -> str:
+    content = {
+        "description": " ".join(candidate.description.split()),
+        "raw_search_snippet": " ".join(candidate.raw_search_snippet.split()),
+        "employee_count": candidate.employee_count,
+        "pre_qualified": candidate.pre_qualified,
+        "evidence": [
+            {
+                "evidence_id": evidence.evidence_id,
+                "content_hash": evidence.content_hash,
+                "excerpt": evidence.excerpt,
+            }
+            for evidence in candidate.source_evidence
+        ],
+    }
+    serialized = json.dumps(content, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _official_location_page_url(links: list[dict[str, str]], official_url: str) -> str | None:
+    """Choose one same-site About, location, or contact page for location verification."""
+    official_domain = normalized_domain(official_url)
+    choices: list[tuple[int, str]] = []
+    for link in links:
+        url = link.get("url", "")
+        if not url.startswith(("http://", "https://")) or normalized_domain(url) != official_domain:
+            continue
+        path = urlparse(url).path.lower()
+        label = link.get("text", "").lower()
+        combined = f"{path} {label}"
+        score = max(
+            (value for marker, value in (("location", 4), ("about", 3), ("contact", 2), ("our story", 1), ("who we are", 1)) if marker in combined),
+            default=0,
+        )
+        if score:
+            choices.append((score, url))
+    choices.sort(key=lambda item: (-item[0], item[1]))
+    return choices[0][1] if choices else None
+
+
 def create_graph(
     settings: Settings | None = None,
     search_provider: SearchProvider | None = None,
@@ -153,33 +199,51 @@ def create_graph(
         size_text = ""
         if request.company_size.min_employees or request.company_size.max_employees:
             size_text = f" companies with {request.company_size.min_employees or 1}-{request.company_size.max_employees or 'many'} employees"
-        base = f"{request.industry} companies in {request.region}{size_text}"
-        if round_number == 1:
-            queries = [
-                f"{base} official website",
-                f"{base} company directory",
-                f"{base} B2B companies company profiles",
-                f"{request.industry} startups and established companies {request.region} website",
-                f"{request.region} {request.industry} vendors products businesses",
-            ]
-        elif round_number == 2:
-            criteria_phrase = " ".join(request.qualification_criteria[:3])
-            queries = [
-                f"{request.region} {request.industry} {criteria_phrase} companies official",
-                f"list of {request.industry} companies in {request.region} with websites",
-                f"{request.region} technology park {request.industry} company directory",
-                f"{request.industry} companies serving businesses {request.region} company profile",
-                f"{base} association member directory product companies",
-            ]
-        else:
-            criteria_phrase = " ".join(request.qualification_criteria[:3])
-            queries = [
-                f"{request.industry} firms {request.region} verified website {criteria_phrase}",
-                f"{request.region} {request.industry} vendors annual report portfolio companies",
-                f"{base} examples clients solutions official contact about",
-                f"{request.region} {request.industry} company registry business listing",
-                f"{criteria_phrase} {request.industry} {request.region} business directory",
-            ]
+        criteria_phrase = " ".join(request.qualification_criteria[:3])
+        size_suffix = f" {size_text.strip()}" if size_text else ""
+        query_rounds = [
+            [
+                f"{request.region} B2B {request.industry} software product companies official websites",
+                f"{request.region} {request.industry} SaaS startups vendors company websites",
+            ],
+            [
+                f"{request.region} {request.industry} {criteria_phrase} company products",
+                f"{request.industry} companies serving business customers in {request.region} official website",
+            ],
+            [
+                f"{request.region} {request.industry} enterprise software companies product website",
+                f"{request.region} {request.industry} software vendors platforms company official",
+            ],
+            [
+                f"{request.region} {request.industry} platform providers product websites",
+                f"{request.industry} B2B product companies in {request.region} company website",
+            ],
+            [
+                f"{request.region} {request.industry} software platforms for businesses product websites",
+                f"{request.region} {request.industry} business software providers official",
+            ],
+            [
+                f"{request.region} {request.industry} software solutions providers for business official",
+                f"{request.region} {request.industry} SaaS company products platform",
+            ],
+            [
+                f"{request.region} {request.industry} startups product company official website",
+                f"{request.region} {request.industry} software vendors customer solutions",
+            ],
+            [
+                f"{request.region} {request.industry} business software platforms vendor website",
+                f"{request.region} {request.industry} technology companies products",
+            ],
+            [
+                f"{request.region} {request.industry} company product customers official site",
+                f"{request.region} {request.industry} software firms enterprise solution provider",
+            ],
+            [
+                f"{request.region} {request.industry} product-led B2B software companies official website",
+                f"{request.region} {request.industry} company platform features customers",
+            ],
+        ]
+        queries = [f"{query}{size_suffix}" for query in query_rounds[(round_number - 1) % len(query_rounds)]]
         if remaining_budget <= 0:
             return {
                 "search_results": [],
@@ -199,6 +263,7 @@ def create_graph(
         batches = [item for item in batch_results if not isinstance(item, BaseException)]
         seen = set(existing_urls)
         found = []
+        editorial_filtered = 0
         for batch in batches:
             for item in batch:
                 try:
@@ -207,6 +272,9 @@ def create_graph(
                     if not domain or normalized in seen:
                         continue
                     seen.add(normalized)
+                    if is_editorial_listicle(item.url, item.title, item.snippet):
+                        editorial_filtered += 1
+                        continue
                     found.append(item.model_copy(update={"url": item.url.strip()}))
                 except Exception:
                     continue
@@ -227,6 +295,7 @@ def create_graph(
                 search_round=round_number,
                 queries=queries,
                 remaining_budget=remaining_budget,
+                editorial_pages_filtered=editorial_filtered,
                 failed_query_errors=failed_queries,
             )],
         }
@@ -239,14 +308,28 @@ def create_graph(
 
         async def research(raw: dict[str, Any]) -> Candidate:
             source_url = raw["url"]
-            async with semaphore:
-                source_snapshot = await website_reader.fetch(source_url)
-            source_title = source_snapshot.h1 or source_snapshot.title
+            raw_title = raw.get("title", normalized_domain(source_url))
+            raw_snippet = raw.get("snippet", "")
+            preliminary_directory = is_business_directory(source_url, raw_title, raw_snippet)
+            search_text = f"{raw_title} {raw_snippet}".lower()
+            industry_signals = {"ai", "ml", "machine", "learning", "artificial", "intelligence", "software", "saas"}
+            has_industry_signal = bool(industry_signals.intersection(re.findall(r"[a-z0-9]+", search_text)))
+            if search_text.strip() and not has_industry_signal and not preliminary_directory:
+                source_snapshot = WebsiteSnapshot(
+                    requested_url=source_url,
+                    final_url=source_url,
+                    outcome="unknown",
+                    error="Page fetch deferred because the search result did not match the requested industry.",
+                )
+            else:
+                async with semaphore:
+                    source_snapshot = await website_reader.fetch(source_url)
+            source_title = source_snapshot.title or source_snapshot.h1
             title = _clean_company_name(
                 source_title if source_snapshot.outcome == "reachable" else "",
                 raw.get("title", normalized_domain(source_url)),
             )
-            directory_source = is_business_directory(
+            directory_source = preliminary_directory or is_business_directory(
                 source_url,
                 title=raw.get("title", ""),
                 snippet=raw.get("snippet", ""),
@@ -262,7 +345,7 @@ def create_graph(
                     async with semaphore:
                         company_snapshot = await website_reader.fetch(official_url)
                     if company_snapshot.outcome == "reachable":
-                        official_title = company_snapshot.h1 or company_snapshot.title
+                        official_title = company_snapshot.title or company_snapshot.h1
                         if official_title:
                             title = _clean_company_name(official_title, title)
                 else:
@@ -273,8 +356,6 @@ def create_graph(
                 raw.get("source_type", "web_search_result"),
                 f"{raw.get('title', title)}. {raw.get('snippet', '')}",
             )]
-            if source_snapshot.text:
-                evidence.append(evidence_from_text(source_snapshot.final_url or source_url, "source_page", source_snapshot.text[:2500]))
             company_text = ""
             contact_access = ContactAccess.UNKNOWN
             if company_snapshot is not None:
@@ -282,6 +363,7 @@ def create_graph(
                 if company_snapshot.text:
                     evidence.append(evidence_from_text(company_snapshot.final_url or official_url or source_url, "company_website", company_text[:2500]))
                 contact_access = company_snapshot.contact_access
+                contact_snapshot = None
                 if contact_access != ContactAccess.SKIPPED_REQUIRES_LOGIN:
                     contact_links = [
                         link for link in company_snapshot.links
@@ -305,7 +387,40 @@ def create_graph(
                         else:
                             contact_access = ContactAccess.UNKNOWN
 
-            combined = " ".join([raw.get("snippet", ""), source_snapshot.text, company_text])
+                # The homepage often omits the company's location. Reuse a public contact
+                # page when it states the requested region; otherwise try one same-site
+                # About/location page. This is a direct URL fetch, not another search.
+                location_page = None
+                if request.region.lower() not in company_text.lower():
+                    if contact_snapshot and contact_snapshot.outcome == "reachable" and request.region.lower() in (
+                        contact_snapshot.meta_description + " " + contact_snapshot.text
+                    ).lower():
+                        location_page = contact_snapshot
+                    else:
+                        about_url = _official_location_page_url(company_snapshot.links, company_snapshot.final_url or official_url or source_url)
+                        if about_url and (not contact_snapshot or about_url != contact_url):
+                            async with semaphore:
+                                about_snapshot = await website_reader.fetch(about_url)
+                            if about_snapshot.outcome == "reachable" and request.region.lower() in (
+                                about_snapshot.meta_description + " " + about_snapshot.text
+                            ).lower():
+                                location_page = about_snapshot
+                if location_page:
+                    location_text = " ".join([location_page.meta_description, location_page.text]).strip()
+                    company_text = " ".join([company_text, location_text]).strip()
+                    evidence.append(evidence_from_text(
+                        location_page.final_url or location_page.requested_url,
+                        "company_website",
+                        location_text[:2500],
+                    ))
+
+            # Keep official proof in the first model-input evidence slots; the LLM is
+            # given a bounded sample of three records per company.
+            if source_snapshot.text:
+                source_evidence = evidence_from_text(source_snapshot.final_url or source_url, "source_page", source_snapshot.text[:2500])
+                evidence.append(source_evidence)
+
+            combined = " ".join([raw_snippet, source_snapshot.text, company_text])
             source_for_domain = official_url or source_url
             if directory_source and not official_url:
                 website_url = ""
@@ -331,7 +446,7 @@ def create_graph(
                 region_evidence=request.region if request.region.lower() in combined.lower() else None,
                 employee_count=_parse_employee_count(combined),
                 source_evidence=evidence,
-                raw_search_snippet=raw.get("snippet", ""),
+                raw_search_snippet=raw_snippet,
                 website_status=site_status,
                 website_checked_at=(company_snapshot.fetched_at if company_snapshot else source_snapshot.fetched_at),
                 contact_access=contact_access,
@@ -380,7 +495,9 @@ def create_graph(
         by_id = {candidate.candidate_id: candidate for candidate in _candidate_objects(state)}
         for candidate in new_candidates:
             by_id[candidate.candidate_id] = candidate
-        combined_candidates = list(by_id.values())
+        # Research may reveal two search URLs for the same company only after their
+        # pages have been fetched. Merge identities here as well as before fetching.
+        combined_candidates = deduplicate_candidates(list(by_id.values()))
         return {
             "candidates": _candidate_dicts(combined_candidates),
             "events": [_event(
@@ -394,24 +511,37 @@ def create_graph(
 
     async def deep_qualify(state: AgentState) -> dict[str, Any]:
         request = LeadRequest.model_validate(state["request"])
-        candidates = [c for c in _candidate_objects(state) if c.decision != Decision.DUPLICATE and c.pre_qualified is not False]
+        all_candidates = _candidate_objects(state)
+        candidates = [c for c in all_candidates if c.decision != Decision.DUPLICATE and c.pre_qualified is not False]
+        pending = [
+            candidate for candidate in candidates
+            if candidate.last_classified_evidence_hash != _candidate_evidence_hash(candidate)
+        ]
         semaphore = asyncio.Semaphore(settings.max_concurrency)
 
-        async def classify_one(candidate: Candidate) -> Candidate:
+        async def classify_batch(batch: list[Candidate]) -> dict[str, Any]:
             async with semaphore:
-                classification = await classifier.classify(request, candidate)
-            return candidate.model_copy(update={
+                return await classifier.classify_many(request, batch)
+
+        batches = [pending[index:index + settings.llm_batch_size] for index in range(0, len(pending), settings.llm_batch_size)]
+        batch_results = await asyncio.gather(*(classify_batch(batch) for batch in batches))
+        classifications = {candidate_id: result for result in batch_results for candidate_id, result in result.items()}
+        output = []
+        for candidate in all_candidates:
+            classification = classifications.get(candidate.candidate_id)
+            if classification is None:
+                output.append(candidate)
+                continue
+            output.append(candidate.model_copy(update={
                 "decision": classification.decision,
                 "confidence": classification.confidence,
                 "rationale": classification.rationale,
                 "matched_criteria": classification.matched_criteria,
                 "missing_criteria": classification.missing_criteria,
                 "decision_evidence_ids": classification.evidence_ids,
-            })
-
-        classified = await asyncio.gather(*(classify_one(candidate) for candidate in candidates))
-        classified_by_id = {c.candidate_id: c for c in classified}
-        output = [classified_by_id.get(c.candidate_id, c) for c in _candidate_objects(state)]
+                "last_classified_evidence_hash": _candidate_evidence_hash(candidate),
+            }))
+        classified = [candidate for candidate in output if candidate.candidate_id in classifications]
         budget = current_budget()
         llm_active = classifier.llm is not None and (
             not settings.mock_mode or settings.llm_in_mock_mode or budget is not None
@@ -422,6 +552,7 @@ def create_graph(
                               qualified=sum(c.decision == Decision.QUALIFIED for c in classified),
                               rejected=sum(c.decision == Decision.REJECTED for c in classified),
                               uncertain=sum(c.decision == Decision.UNCERTAIN for c in classified),
+                              reclassified=len(classified), batch_count=len(batches),
                               classifier="LLM with structured output and rule-based budget fallback" if llm_active and budget is not None else "LLM with structured output" if llm_active else "conservative deterministic fallback")],
         }
 
@@ -434,7 +565,18 @@ def create_graph(
     async def targeted_research(state: AgentState) -> dict[str, Any]:
         request = LeadRequest.model_validate(state["request"])
         candidates = _candidate_objects(state)
-        pending = [c for c in candidates if c.decision == Decision.UNCERTAIN and c.confidence >= 0.50 and c.confidence <= 0.70 and c.targeted_attempts < 1]
+        pending = [c for c in candidates if c.decision == Decision.UNCERTAIN and 0.50 <= c.confidence <= 0.70 and c.targeted_attempts < 1]
+        pending.sort(key=lambda candidate: (
+            candidate.website_status == WebsiteStatus.ACTIVE,
+            candidate.confidence,
+            len(candidate.matched_criteria),
+        ), reverse=True)
+        used = int(state.get("targeted_searches_used", 0))
+        remaining = max(0, settings.max_targeted_searches_per_run - used)
+        pending = pending[:remaining]
+        usage = current_usage()
+        if usage is not None:
+            usage.increment("targeted_company_searches", len(pending))
         semaphore = asyncio.Semaphore(settings.max_concurrency)
         async def enrich(candidate: Candidate) -> Candidate:
             query = f'"{candidate.company_name}" {request.region} {" ".join(candidate.missing_criteria[:2])} company'
@@ -445,13 +587,30 @@ def create_graph(
                     snapshot = await website_reader.fetch(candidate.website_url) if candidate.website_url else None
                 if snapshot and snapshot.text:
                     extra.append(evidence_from_text(snapshot.final_url or candidate.website_url, "targeted_company_page", snapshot.text[:1500]))
-                return candidate.model_copy(update={"source_evidence": candidate.source_evidence + extra, "description": (candidate.description + " " + " ".join(e.excerpt for e in extra))[:2500], "targeted_attempts": candidate.targeted_attempts + 1})
+                evidence_by_id = {item.evidence_id: item for item in candidate.source_evidence}
+                evidence_by_id.update({item.evidence_id: item for item in extra})
+                excerpts = " ".join(item.excerpt for item in extra)
+                description = " ".join(f"{candidate.description} {excerpts}".split())[:2500]
+                return candidate.model_copy(update={
+                    "source_evidence": list(evidence_by_id.values()),
+                    "description": description,
+                    "targeted_attempts": candidate.targeted_attempts + 1,
+                })
             except Exception:
                 return candidate.model_copy(update={"targeted_attempts": candidate.targeted_attempts + 1})
         updated = {c.candidate_id: c for c in candidates}
         for c in await asyncio.gather(*(enrich(c) for c in pending)):
             updated[c.candidate_id] = c
-        return {"candidates": _candidate_dicts(list(updated.values())), "events": [_event("targeted_research", "ok", f"Ran bounded gap-filling research for {len(pending)} borderline candidates.")]}
+        return {
+            "candidates": _candidate_dicts(list(updated.values())),
+            "targeted_searches_used": used + len(pending),
+            "events": [_event(
+                "targeted_research", "ok",
+                f"Ran gap-filling research for {len(pending)} of {len(candidates)} eligible borderline candidates.",
+                selected=len(pending), skipped=max(0, len([c for c in candidates if c.decision == Decision.UNCERTAIN and 0.50 <= c.confidence <= 0.70 and c.targeted_attempts < 1]) - len(pending)),
+                run_limit=settings.max_targeted_searches_per_run,
+            )],
+        }
 
     async def deduplicate(state: AgentState) -> dict[str, Any]:
         # Before any page fetch, discard domains already in the CRM and URLs repeated
@@ -496,23 +655,16 @@ def create_graph(
 
     async def fast_verify(state: AgentState) -> dict[str, Any]:
         pending = state.get("unprocessed_urls", [])
-        semaphore = asyncio.Semaphore(settings.max_concurrency)
-        async def check(raw: dict[str, Any]) -> dict[str, Any] | None:
-            budget = current_budget()
-            if budget is not None and budget.browserbase_calls >= budget.browserbase_limit:
-                return raw
-            # Directory pages need ordinary retrieval for outbound link extraction.
-            if is_business_directory(raw.get("url", ""), raw.get("title", ""), raw.get("snippet", "")):
-                return raw
-            try:
-                async with semaphore:
-                    result = await website_reader.verify(raw["url"])
-                return raw if result.outcome == "reachable" else None
-            except Exception:
-                return None
-        checked = await asyncio.gather(*(check(raw) for raw in pending))
-        alive = [raw for raw in checked if raw is not None]
-        return {"unprocessed_urls": alive, "events": [_event("fast_verify", "ok", f"Kept {len(alive)} of {len(pending)} candidate URLs after the lightweight availability check.", discarded=len(pending)-len(alive))]}
+        # Avoid fetching every URL once here and again during evidence collection.
+        # Research records page content; independent availability verification runs later.
+        return {
+            "unprocessed_urls": pending,
+            "events": [_event(
+                "fast_verify", "ok",
+                f"Deferred availability checks for {len(pending)} URLs to evidence collection and final verification.",
+                deferred=len(pending),
+            )],
+        }
 
     async def cheap_filter(state: AgentState) -> dict[str, Any]:
         # Fast, deterministic first pass over fetched titles/descriptions; the structured
@@ -531,8 +683,15 @@ def create_graph(
     async def verify_websites(state: AgentState) -> dict[str, Any]:
         candidates = _candidate_objects(state)
         semaphore = asyncio.Semaphore(settings.max_concurrency)
+        eligible_ids = {
+            candidate.candidate_id
+            for candidate in candidates
+            if candidate.decision == Decision.QUALIFIED and candidate.website_url
+        }
 
         async def verify_one(candidate: Candidate) -> Candidate:
+            if candidate.candidate_id not in eligible_ids:
+                return candidate
             if not candidate.website_url:
                 return candidate.model_copy(update={
                     "website_status": WebsiteStatus.UNKNOWN,
@@ -574,10 +733,11 @@ def create_graph(
         verified = await asyncio.gather(*(verify_one(candidate) for candidate in candidates))
         return {
             "candidates": _candidate_dicts(list(verified)),
-            "events": [_event("verify_websites", "ok", "Independently re-checked candidate websites.",
+            "events": [_event("verify_websites", "ok", "Independently re-checked qualified candidate websites.",
                               active=sum(c.website_status == WebsiteStatus.ACTIVE for c in verified),
                               inactive=sum(c.website_status == WebsiteStatus.INACTIVE for c in verified),
-                              unknown=sum(c.website_status == WebsiteStatus.UNKNOWN for c in verified))],
+                              unknown=sum(c.website_status == WebsiteStatus.UNKNOWN for c in verified),
+                              skipped=len(candidates) - len(eligible_ids))],
         }
 
     def route_after_discovery(state: AgentState) -> Literal["research_candidates", "prepare_proposal"]:
@@ -604,7 +764,12 @@ def create_graph(
 
     def route_after_deep_qualify(state: AgentState) -> Literal["targeted_research", "verify_websites"]:
         candidates = _candidate_objects(state)
-        if any(c.decision == Decision.UNCERTAIN and 0.50 <= c.confidence <= 0.70 and c.targeted_attempts < 1 for c in candidates):
+        has_targetable = any(
+            c.decision == Decision.UNCERTAIN and 0.50 <= c.confidence <= 0.70 and c.targeted_attempts < 1
+            for c in candidates
+        )
+        has_budget = int(state.get("targeted_searches_used", 0)) < settings.max_targeted_searches_per_run
+        if has_targetable and has_budget:
             return "targeted_research"
         return "verify_websites"
 
@@ -813,6 +978,22 @@ def create_graph(
         pending_review = sum(c.decision == Decision.UNCERTAIN or c.website_status == WebsiteStatus.UNKNOWN for c in candidates)
         imported = sum(c.import_status in {ImportStatus.IMPORTED, ImportStatus.ALREADY_EXISTS} for c in candidates)
         failures = sum(c.import_status == ImportStatus.FAILED for c in candidates)
+        usage_counts = state.get("usage", {})
+        llm_batch_calls = int(usage_counts.get("llm_batch_calls", 0))
+        llm_http_attempts = int(usage_counts.get("llm_http_attempts", 0))
+        usage_summary = RunUsageSummary(
+            llm_batch_calls=llm_batch_calls,
+            llm_http_attempts=llm_http_attempts,
+            llm_retry_attempts=max(0, llm_http_attempts - llm_batch_calls),
+            browserbase_search_requests=int(usage_counts.get("browserbase_search_requests", 0)),
+            browserbase_fetch_requests=int(usage_counts.get("browserbase_fetch_requests", 0)),
+            browserbase_session_requests=int(usage_counts.get("browserbase_session_requests", 0)),
+            browserbase_total_requests=sum(int(usage_counts.get(name, 0)) for name in (
+                "browserbase_search_requests", "browserbase_fetch_requests", "browserbase_session_requests"
+            )),
+            direct_fetch_requests=int(usage_counts.get("direct_fetch_requests", 0)),
+            targeted_company_searches=int(usage_counts.get("targeted_company_searches", 0)),
+        )
         notes: list[str] = []
         proposed_count = len(state.get("proposal", {}).get("candidate_ids", []))
         target_shortfall = max(0, request.target_leads - proposed_count)
@@ -837,12 +1018,10 @@ def create_graph(
             )
             notes.append(f"This run used synthetic mock sources. {storage_note}")
         if request.test_mode:
-            budget = current_budget()
-            if budget is not None:
-                notes.append(
-                    f"Low-call test mode used {budget.browserbase_calls}/{budget.browserbase_limit} Browserbase requests "
-                    f"and {budget.llm_calls}/{budget.llm_limit} LLM calls; qualification beyond the LLM cap uses rule-based evaluation."
-                )
+            notes.append(
+                f"Low-call test mode used {usage_summary.browserbase_total_requests} Browserbase requests "
+                f"and {usage_summary.llm_batch_calls} LLM batch calls; qualification beyond the LLM cap uses rule-based evaluation."
+            )
         report = AgentReport(
             request_id=request.request_id,
             run_id=run_id,
@@ -862,25 +1041,40 @@ def create_graph(
             candidates=[c.model_dump(mode="json") for c in candidates],
             events=state.get("events", []),
             notes=notes,
+            usage=usage_summary,
         )
-        return {"candidates": _candidate_dicts(candidates), "report": report.model_dump(mode="json"), "events": [_event("build_report", "ok", "Built auditable final report.")]}
+        return {
+            "candidates": _candidate_dicts(candidates),
+            "report": report.model_dump(mode="json"),
+            "events": [_event("build_report", "ok", "Built auditable final report.", usage=usage_summary.model_dump(mode="json"))],
+        }
+
+    def track_usage(node):
+        async def tracked(state: AgentState) -> dict[str, Any]:
+            tracker = current_usage()
+            before = tracker.snapshot() if tracker is not None else None
+            update = await node(state)
+            if tracker is not None and before is not None:
+                update["usage"] = usage_delta(before, tracker.snapshot())
+            return update
+        return tracked
 
     builder = StateGraph(AgentState)
-    builder.add_node("validate_input", validate_input)
-    builder.add_node("discover_candidates", discover_candidates)
-    builder.add_node("deduplicate", deduplicate)
-    builder.add_node("extract_directory_links", extract_directory_links)
-    builder.add_node("fast_verify", fast_verify)
-    builder.add_node("research_candidates", research_candidates)
-    builder.add_node("cheap_filter", cheap_filter)
-    builder.add_node("deep_qualify", deep_qualify)
-    builder.add_node("targeted_research", targeted_research)
-    builder.add_node("verify_websites", verify_websites)
-    builder.add_node("prepare_proposal", prepare_proposal)
-    builder.add_node("approval_gate", approval_gate)
-    builder.add_node("execute_import", execute_import)
-    builder.add_node("verify_import", verify_import)
-    builder.add_node("build_report", build_report)
+    builder.add_node("validate_input", track_usage(validate_input))
+    builder.add_node("discover_candidates", track_usage(discover_candidates))
+    builder.add_node("deduplicate", track_usage(deduplicate))
+    builder.add_node("extract_directory_links", track_usage(extract_directory_links))
+    builder.add_node("fast_verify", track_usage(fast_verify))
+    builder.add_node("research_candidates", track_usage(research_candidates))
+    builder.add_node("cheap_filter", track_usage(cheap_filter))
+    builder.add_node("deep_qualify", track_usage(deep_qualify))
+    builder.add_node("targeted_research", track_usage(targeted_research))
+    builder.add_node("verify_websites", track_usage(verify_websites))
+    builder.add_node("prepare_proposal", track_usage(prepare_proposal))
+    builder.add_node("approval_gate", track_usage(approval_gate))
+    builder.add_node("execute_import", track_usage(execute_import))
+    builder.add_node("verify_import", track_usage(verify_import))
+    builder.add_node("build_report", track_usage(build_report))
 
     builder.add_edge(START, "validate_input")
     builder.add_edge("validate_input", "discover_candidates")

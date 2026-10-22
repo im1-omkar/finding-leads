@@ -11,8 +11,26 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _strip_nul(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, list):
+        return [_strip_nul(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_nul(item) for item in value)
+    if isinstance(value, dict):
+        return {_strip_nul(key): _strip_nul(item) for key, item in value.items()}
+    return value
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", use_enum_values=True)
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def remove_postgres_unsupported_nul(cls, value: Any) -> Any:
+        """Strip NULs from untrusted page text before it reaches PostgreSQL JSONB."""
+        return _strip_nul(value)
 
 
 class CompanySize(StrictModel):
@@ -112,6 +130,26 @@ class Classification(StrictModel):
     evidence_ids: list[str] = Field(default_factory=list)
 
 
+class CandidateClassification(Classification):
+    candidate_id: str
+
+
+class BatchClassification(StrictModel):
+    classifications: list[CandidateClassification]
+
+
+class RunUsageSummary(StrictModel):
+    llm_batch_calls: int = 0
+    llm_http_attempts: int = 0
+    llm_retry_attempts: int = 0
+    browserbase_search_requests: int = 0
+    browserbase_fetch_requests: int = 0
+    browserbase_session_requests: int = 0
+    browserbase_total_requests: int = 0
+    direct_fetch_requests: int = 0
+    targeted_company_searches: int = 0
+
+
 class WebsiteSnapshot(StrictModel):
     requested_url: str
     final_url: str | None = None
@@ -125,6 +163,7 @@ class WebsiteSnapshot(StrictModel):
     outcome: str = "unknown"  # reachable | inactive | unknown
     error: str | None = None
     contact_access: ContactAccess = ContactAccess.UNKNOWN
+    needs_browser: bool = False
 
 
 class Candidate(StrictModel):
@@ -147,6 +186,7 @@ class Candidate(StrictModel):
     matched_criteria: list[str] = Field(default_factory=list)
     missing_criteria: list[str] = Field(default_factory=list)
     decision_evidence_ids: list[str] = Field(default_factory=list)
+    last_classified_evidence_hash: str | None = None
     duplicate_of: str | None = None
     alias_domains: list[str] = Field(default_factory=list)
     website_status: WebsiteStatus = WebsiteStatus.UNKNOWN
@@ -203,3 +243,4 @@ class AgentReport(StrictModel):
     candidates: list[dict[str, Any]] = Field(default_factory=list)
     events: list[dict[str, Any]] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    usage: RunUsageSummary = Field(default_factory=RunUsageSummary)
