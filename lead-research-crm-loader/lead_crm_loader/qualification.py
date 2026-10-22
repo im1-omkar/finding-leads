@@ -9,7 +9,17 @@ import httpx
 
 from .config import Settings
 from .call_budget import LLMBudgetExhausted, current_budget
-from .models import BatchClassification, Candidate, CandidateClassification, Classification, Decision, LeadRequest, WebsiteStatus
+from .models import (
+    BatchClassification,
+    BatchEmployeeCountAssessment,
+    Candidate,
+    CandidateClassification,
+    Classification,
+    Decision,
+    EmployeeCountAssessment,
+    LeadRequest,
+    WebsiteStatus,
+)
 from .usage import current_usage
 
 STOP_WORDS = {
@@ -125,8 +135,10 @@ class LLMClassifier:
         if default_headers:
             kwargs["default_headers"] = default_headers
         self.model = ChatOpenAI(**kwargs).with_structured_output(BatchClassification)
+        self.employee_model = ChatOpenAI(**kwargs).with_structured_output(BatchEmployeeCountAssessment)
         # Keep test-mode provider attempts strict by disabling the client's retries.
         self.limited_model = ChatOpenAI(**{**kwargs, "max_retries": 0}).with_structured_output(BatchClassification)
+        self.limited_employee_model = ChatOpenAI(**{**kwargs, "max_retries": 0}).with_structured_output(BatchEmployeeCountAssessment)
 
     @staticmethod
     def _candidate_payload(candidate: Candidate) -> dict[str, Any]:
@@ -186,6 +198,51 @@ class LLMClassifier:
         result = await model.ainvoke(prompt)
         batch = result if isinstance(result, BatchClassification) else BatchClassification.model_validate(result)
         return batch.classifications
+
+    async def assess_employee_counts(self, candidates: list[Candidate]) -> list[EmployeeCountAssessment]:
+        prompt = [
+            (
+                "system",
+                "You verify explicitly reported company headcounts from independent public sources. "
+                "Evaluate each candidate separately and use only its strict_employee_search evidence. "
+                "Set company_match=true only when the source clearly refers to the exact supplied company, not a similar name. "
+                "Do not infer or estimate headcount. For a stated range such as 11-50 employees, return employee_min=11 and employee_max=50. "
+                "For an exact count, return that value in both fields. If evidence is missing, ambiguous, contradictory, or about another company, return null for both fields. "
+                "Cite only exact evidence_ids from that candidate and return one assessment for every candidate_id."
+            ),
+            (
+                "human",
+                "CANDIDATES: " + json.dumps([
+                    {
+                        "candidate_id": candidate.candidate_id,
+                        "company_name": candidate.legal_name or candidate.company_name,
+                        "domain": candidate.domain,
+                        "evidence": [
+                            {
+                                "evidence_id": evidence.evidence_id,
+                                "source_url": evidence.source_url,
+                                "excerpt": evidence.excerpt[:800],
+                            }
+                            for evidence in candidate.source_evidence
+                            if evidence.source_type == "strict_employee_search"
+                        ],
+                    }
+                    for candidate in candidates
+                ], ensure_ascii=False, separators=(",", ":")),
+            ),
+        ]
+        budget = current_budget()
+        model = self.employee_model
+        if budget is not None:
+            if not budget.reserve_llm():
+                raise LLMBudgetExhausted("Test-mode LLM call budget exhausted")
+            model = self.limited_employee_model
+        usage = current_usage()
+        if usage is not None:
+            usage.increment("llm_batch_calls")
+        result = await model.ainvoke(prompt)
+        batch = result if isinstance(result, BatchEmployeeCountAssessment) else BatchEmployeeCountAssessment.model_validate(result)
+        return batch.assessments
 
     async def classify(self, request: LeadRequest, candidate: Candidate) -> Classification:
         results = await self.classify_many(request, [candidate])

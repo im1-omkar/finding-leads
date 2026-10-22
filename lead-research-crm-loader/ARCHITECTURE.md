@@ -21,6 +21,7 @@ The design deliberately separates **judgment** from **invariants**:
 | `qualify_candidates` | Classify candidates as qualified/rejected/uncertain; check citation IDs and numeric company-size constraints | Decision, confidence, rationale, matched/missing criteria |
 | `deduplicate` | Merge exact normalized-domain and exact normalized legal-name matches; keep uncertain/fuzzy matches visible rather than silently merging | One canonical identity plus explicit duplicate rows and alias domains |
 | `verify_websites` | Re-check each established company site separately from discovery | Active/inactive/unknown status and check time |
+| `strict_employee_check` | Only when the `Strict search` checkbox is enabled, check employee-count bounds for otherwise-proposed leads against LinkedIn company pages or public company careers/team pages | Adds independent-source evidence; keeps in-range leads qualified, rejects out-of-range counts, and marks missing or ambiguous counts uncertain |
 | `prepare_proposal` | Select only qualified, active candidates and freeze exact proposed changes into a hash | Versioned import proposal |
 | `approval_gate` | Pause the graph; validate reviewer decision, hash, and candidate IDs when resumed | Explicit approve/reject decision |
 | `execute_import` | Write only selected candidate IDs from the exact approved proposal | Per-record CRM results and import statuses |
@@ -44,9 +45,12 @@ flowchart TD
     I --> H
     H --> J[Independent website verification]
     J -->|Need more leads and budget remains| B
-    J -->|Quota met or exhausted| K[Prepare hashed proposal]
-    K -->|No eligible leads| P[Build report]
-    K -->|Eligible leads| L{Human approval interrupt}
+    J -->|Quota met or exhausted| X{Strict search enabled?}
+    X -->|Yes| K[Strict employee-size check]
+    X -->|No| Y[Prepare hashed proposal]
+    K --> Y
+    Y -->|No eligible leads| P[Build report]
+    Y -->|Eligible leads| L{Human approval interrupt}
     L -->|Reject / invalid / stale approval| P
     L -->|Approve selected IDs| M[Idempotent CRM writes]
     M --> N[Independent CRM read-back]
@@ -59,9 +63,11 @@ Directory extraction follows only explicit outbound company website links. Targe
 
 The target is a **goal, not permission to invent leads**. Search stops when enough active qualified leads are available or the configured research budget is exhausted. The report should make a shortfall visible rather than filling the target with weak or unsupported candidates.
 
+`strict_employee_check` is a gated step immediately before `prepare_proposal`. When disabled, graph routing bypasses it and makes no extra source or LLM calls. When enabled with a minimum and/or maximum employee bound, it checks every otherwise-proposed qualified, active lead with at most one targeted Browserbase search query per lead. Search results are retained only when they point to a LinkedIn company profile or a public careers, jobs, hiring, or team page on that company's domain. It does not fetch those pages, start another discovery round, or run another qualification/research loop. Structured LLM assessments use batches capped at 25 leads and also respect `LLM_BATCH_SIZE`; at the default batch size, the request model's 200-lead maximum requires at most eight extra LLM batches. Ordinary code validates the company match, citations, explicit headcount interval, and requested numeric bounds. A confirmed mismatch is rejected; an unavailable, conflicting, or ambiguous count stays uncertain and is omitted from the proposal. If no employee bounds were provided, the node records a skip and makes no extra calls.
+
 ## Core data contracts
 
-- `LeadRequest`: stable request ID, industry, region, optional employee range, explicit qualification criteria and requested target.
+- `LeadRequest`: stable request ID, industry, region, optional employee range, explicit qualification criteria, requested target, and an opt-in `strict_search` flag.
 - `Candidate`: stable candidate ID, candidate/company identity, normalized domain, website status, source evidence, decision, confidence, rationale, duplicate relationship and import state.
 - `Evidence`: stable evidence ID, source URL/type, retrieval timestamp, excerpt and content hash.
 - `ApprovalDecision`: reviewer ID, approve/reject decision, proposal hash and selected candidate IDs.
@@ -74,13 +80,14 @@ All web evidence is untrusted input. A page may contain promotional claims or ad
 1. No CRM write occurs before the approval interrupt resumes with a valid decision.
 2. Approval must match the exact proposal hash and may reference only IDs included in that proposal.
 3. Only qualified candidates with an independently reachable official company site are proposed for import.
-4. Directory URLs are kept as evidence; a directory's domain is not treated as the company's domain when an official URL cannot be established.
-5. Uncertain candidates stay visible but are not automatically imported.
-6. Exact domain/name duplicates are merged; fuzzy matches should become review suggestions, not automatic merges.
-7. CRM writes use PostgreSQL idempotency keys and check for existing domain/name records before creating.
-8. Every imported/existing record is read back and compared with the intended name/domain.
-9. 404/410 mark a site inactive for this scenario; timeout, 429, 5xx and ambiguous outcomes remain inconclusive unless independent evidence confirms inactivity.
-10. Restricted contact pages are skipped without authentication attempts or bypasses.
+4. When strict search is enabled, an employee-size bound must be supported by a cited LinkedIn company profile or public company careers/team page; code compares the reported interval with the requested bounds.
+5. Directory URLs are kept as evidence; a directory's domain is not treated as the company's domain when an official URL cannot be established.
+6. Uncertain candidates stay visible but are not automatically imported.
+7. Exact domain/name duplicates are merged; fuzzy matches should become review suggestions, not automatic merges.
+8. CRM writes use PostgreSQL idempotency keys and check for existing domain/name records before creating.
+9. Every imported/existing record is read back and compared with the intended name/domain.
+10. 404/410 mark a site inactive for this scenario; timeout, 429, 5xx and ambiguous outcomes remain inconclusive unless independent evidence confirms inactivity.
+11. Restricted contact pages are skipped without authentication attempts or bypasses.
 
 ## State persistence and human approval
 

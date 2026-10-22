@@ -313,6 +313,16 @@ class MockSearchProvider:
         self._lock = asyncio.Lock()
 
     async def search(self, query: str, max_results: int = 20) -> list[SearchResult]:
+        if query.lower().startswith("site:linkedin.com/company"):
+            match = re.search(r'"([^"]+)"', query)
+            name = match.group(1) if match else "Mock Company"
+            slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:80] or "mock-company"
+            return [SearchResult(
+                title=f"{name} | LinkedIn",
+                url=f"https://www.linkedin.com/company/{slug}/",
+                snippet=f"{name} company profile. 25 employees.",
+                source_type="strict_employee_search",
+            )]
         # Partition results across concurrent queries so the mock can satisfy the
         # configured target without repeatedly returning only the first page.
         async with self._lock:

@@ -15,7 +15,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
 from .config import Settings
-from .call_budget import current_budget
+from .call_budget import LLMBudgetExhausted, current_budget
 from .crm import CRMAdapter, build_crm_adapter
 from .deduplication import deduplicate_candidates
 from .models import (
@@ -24,6 +24,7 @@ from .models import (
     Candidate,
     ContactAccess,
     Decision,
+    EmployeeCountAssessment,
     ImportStatus,
     LeadRequest,
     RunUsageSummary,
@@ -95,6 +96,44 @@ def _parse_employee_count(text: str) -> int | None:
         if match:
             return int(match.group(1))
     return None
+
+
+def _parse_employee_range(text: str) -> tuple[int, int | None] | None:
+    """Return an explicitly reported headcount or band; never estimate from vague wording."""
+    normalized = text.replace(",", "")
+    range_match = re.search(
+        r"\b(\d{1,6})\s*(?:[-–]|\bto\b)\s*(\d{1,6})\s+(?:employees|people)\b",
+        normalized,
+        re.IGNORECASE,
+    )
+    if range_match:
+        lower, upper = int(range_match.group(1)), int(range_match.group(2))
+        return (lower, upper) if lower <= upper else None
+    open_range = re.search(r"\b(\d{1,6})\s*\+\s*(?:employees|people)\b", normalized, re.IGNORECASE)
+    if open_range:
+        return int(open_range.group(1)), None
+    exact = re.search(r"\b(\d{1,6})\s+(?:employees|people)\b", normalized, re.IGNORECASE)
+    if exact:
+        count = int(exact.group(1))
+        return count, count
+    reverse_exact = re.search(r"\b(?:employees|headcount)\s*[:\-]?\s*(\d{1,6})\b", normalized, re.IGNORECASE)
+    if reverse_exact:
+        count = int(reverse_exact.group(1))
+        return count, count
+    return None
+
+
+def _is_independent_employee_source(url: str, company_domain: str) -> bool:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = normalized_domain(url)
+    path = parsed.path.lower()
+    if host == "linkedin.com" or host.endswith(".linkedin.com"):
+        return "/company/" in path
+    if company_domain and host == normalized_domain(company_domain):
+        return any(marker in path for marker in ("/career", "/job", "/join", "/hiring", "/team"))
+    return False
 
 
 def _clean_company_name(title: str, fallback: str) -> str:
@@ -740,12 +779,240 @@ def create_graph(
                               skipped=len(candidates) - len(eligible_ids))],
         }
 
-    def route_after_discovery(state: AgentState) -> Literal["research_candidates", "prepare_proposal"]:
+    async def strict_employee_check(state: AgentState) -> dict[str, Any]:
+        request = LeadRequest.model_validate(state["request"])
+        candidates = _candidate_objects(state)
+        if not request.strict_search:
+            return {"events": [_event("strict_employee_check", "skipped", "Strict search is disabled; no additional sources or model calls were used.")]}
+        size = request.company_size
+        if size.min_employees is None and size.max_employees is None:
+            return {"events": [_event("strict_employee_check", "skipped", "Strict search needs a minimum or maximum employee count; no additional sources or model calls were used.")]}
+
+        eligible = [
+            candidate for candidate in candidates
+            if candidate.decision == Decision.QUALIFIED and candidate.website_status == WebsiteStatus.ACTIVE
+        ][: request.target_leads]
+        if not eligible:
+            return {"events": [_event("strict_employee_check", "ok", "No otherwise-proposed leads required strict employee-size verification.", checked=0)]}
+
+        attempted_note = "Strict employee search attempted."
+
+        search_targets = [
+            candidate for candidate in eligible
+            if attempted_note not in candidate.verification_notes
+            and not any(
+                _is_independent_employee_source(evidence.source_url, candidate.domain)
+                and _parse_employee_range(evidence.excerpt) is not None
+                for evidence in candidate.source_evidence
+            )
+        ]
+
+        async def search_independent_source(candidate: Candidate) -> tuple[str, list[Any], str | None]:
+            domain = normalized_domain(candidate.domain)[:60] if candidate.domain else ""
+            name = (candidate.legal_name or candidate.company_name)[:60]
+            query = f'site:linkedin.com/company OR site:{domain}/careers "{name}" employees headcount'
+            try:
+                results = await search_provider.search(query, max_results=3)
+            except Exception as exc:
+                return candidate.candidate_id, [], type(exc).__name__
+            evidence = [
+                evidence_from_text(result.url, "strict_employee_search", f"{result.title}. {result.snippet}")
+                for result in results
+                if _is_independent_employee_source(result.url, candidate.domain)
+            ]
+            return candidate.candidate_id, evidence, None
+
+        # One targeted search per proposed lead. No extra discovery rounds, page fetches,
+        # or retries are added by this node.
+        search_results = await asyncio.gather(*(search_independent_source(candidate) for candidate in search_targets))
+        search_results_by_id = {candidate_id: (evidence, error) for candidate_id, evidence, error in search_results}
+        search_target_ids = {candidate.candidate_id for candidate in search_targets}
+        # A retry of this node reuses the existing strict evidence instead of searching again.
+        updated_candidates: list[Candidate] = []
+        for candidate in candidates:
+            if candidate.candidate_id not in {item.candidate_id for item in eligible}:
+                updated_candidates.append(candidate)
+                continue
+            new_evidence, search_error = search_results_by_id.get(candidate.candidate_id, ([], None))
+            evidence_by_id = {evidence.evidence_id: evidence for evidence in candidate.source_evidence}
+            for evidence in candidate.source_evidence:
+                if (
+                    _is_independent_employee_source(evidence.source_url, candidate.domain)
+                    and _parse_employee_range(evidence.excerpt) is not None
+                ):
+                    evidence_by_id[evidence.evidence_id] = evidence.model_copy(update={"source_type": "strict_employee_search"})
+            evidence_by_id.update({evidence.evidence_id: evidence for evidence in new_evidence})
+            notes = list(candidate.verification_notes)
+            if candidate.candidate_id in search_target_ids and attempted_note not in notes:
+                notes.append(attempted_note)
+            if search_error:
+                notes.append(f"Strict employee search failed ({search_error}); headcount remains unverified.")
+            updated_candidates.append(candidate.model_copy(update={
+                "source_evidence": list(evidence_by_id.values()),
+                "verification_notes": notes,
+            }))
+
+        checked_candidates = [
+            candidate for candidate in updated_candidates
+            if candidate.candidate_id in {item.candidate_id for item in eligible}
+        ]
+        with_evidence = [
+            candidate for candidate in checked_candidates
+            if any(evidence.source_type == "strict_employee_search" for evidence in candidate.source_evidence)
+        ]
+        assessments: list[EmployeeCountAssessment] = []
+        llm_active = classifier.llm is not None and (
+            not settings.mock_mode or settings.llm_in_mock_mode or current_budget() is not None
+        )
+        llm_batches = 0
+        if llm_active and with_evidence:
+            strict_batch_size = max(1, min(settings.llm_batch_size, 25))
+            for start in range(0, len(with_evidence), strict_batch_size):
+                batch = with_evidence[start : start + strict_batch_size]
+                llm_batches += 1
+                try:
+                    assessments.extend(await classifier.llm.assess_employee_counts(batch))
+                except LLMBudgetExhausted:
+                    continue
+                except Exception:
+                    continue
+        else:
+            # Offline/mock mode uses only explicit employee counts in the independent-source excerpts.
+            for candidate in with_evidence:
+                parsed = [
+                    (evidence, _parse_employee_range(evidence.excerpt))
+                    for evidence in candidate.source_evidence
+                    if evidence.source_type == "strict_employee_search"
+                    and _is_independent_employee_source(evidence.source_url, candidate.domain)
+                ]
+                parsed = [(evidence, value) for evidence, value in parsed if value is not None]
+                distinct_ranges = {value for _, value in parsed}
+                if len(distinct_ranges) == 1:
+                    lower, upper = next(iter(distinct_ranges))
+                    assessments.append(EmployeeCountAssessment(
+                        candidate_id=candidate.candidate_id,
+                        company_match=True,
+                        employee_min=lower,
+                        employee_max=upper,
+                        evidence_ids=[evidence.evidence_id for evidence, _ in parsed],
+                        rationale="Explicit employee-size information was found in an independent public source.",
+                    ))
+
+        assessment_lists: dict[str, list[Any]] = {}
+        for assessment in assessments:
+            assessment_lists.setdefault(assessment.candidate_id, []).append(assessment)
+        assessment_map = {
+            candidate_id: values[0]
+            for candidate_id, values in assessment_lists.items()
+            if len(values) == 1
+        }
+        verified_count = rejected_count = uncertain_count = 0
+        finalized: list[Candidate] = []
+        eligible_ids = {candidate.candidate_id for candidate in eligible}
+        for candidate in updated_candidates:
+            if candidate.candidate_id not in eligible_ids:
+                finalized.append(candidate)
+                continue
+            assessment = assessment_map.get(candidate.candidate_id)
+            strict_evidence = [
+                evidence for evidence in candidate.source_evidence
+                if evidence.source_type == "strict_employee_search"
+                and _is_independent_employee_source(evidence.source_url, candidate.domain)
+            ]
+            evidence_by_id = {evidence.evidence_id: evidence for evidence in strict_evidence}
+            cited_ids = assessment.evidence_ids if assessment else []
+            cited = [evidence_by_id[evidence_id] for evidence_id in cited_ids if evidence_id in evidence_by_id]
+            parsed_ranges = {_parse_employee_range(evidence.excerpt) for evidence in cited}
+            parsed_ranges.discard(None)
+            assessment_range = (assessment.employee_min, assessment.employee_max) if assessment else None
+            valid_evidence = bool(
+                assessment
+                and assessment.company_match
+                and cited_ids
+                and len(cited) == len(cited_ids)
+                and len(parsed_ranges) == 1
+                and assessment_range in parsed_ranges
+                and assessment.employee_min is not None
+            )
+            if not valid_evidence:
+                uncertain_count += 1
+                criterion = "Independent employee-count evidence within the requested range"
+                rationale = "Strict employee-size check could not verify a headcount from an independent public source."
+                finalized.append(candidate.model_copy(update={
+                    "decision": Decision.UNCERTAIN,
+                    "confidence": min(candidate.confidence, 0.68),
+                    "rationale": rationale,
+                    "missing_criteria": list(dict.fromkeys(candidate.missing_criteria + [criterion])),
+                    "verification_notes": candidate.verification_notes + [rationale],
+                }))
+                continue
+
+            lower, upper = assessment_range
+            below_minimum = size.min_employees is not None and upper is not None and upper < size.min_employees
+            above_maximum = size.max_employees is not None and lower > size.max_employees
+            fits_minimum = size.min_employees is None or lower >= size.min_employees
+            fits_maximum = size.max_employees is None or (upper is not None and upper <= size.max_employees)
+            source_label = ", ".join(sorted({normalized_domain(evidence.source_url) for evidence in cited}))
+            count_label = f"{lower} employees" if lower == upper else f"{lower}+ employees" if upper is None else f"{lower}-{upper} employees"
+            evidence_ids = list(dict.fromkeys(candidate.decision_evidence_ids + cited_ids))
+            if below_minimum or above_maximum:
+                rejected_count += 1
+                reason = f"Independent employee-size evidence reports {count_label} ({source_label}), outside the requested range."
+                finalized.append(candidate.model_copy(update={
+                    "decision": Decision.REJECTED,
+                    "rationale": reason,
+                    "missing_criteria": list(dict.fromkeys(candidate.missing_criteria + [reason])),
+                    "decision_evidence_ids": evidence_ids,
+                    "verification_notes": candidate.verification_notes + [reason],
+                }))
+            elif fits_minimum and fits_maximum:
+                verified_count += 1
+                reason = f"Strict employee-size check confirmed {count_label} using {source_label}."
+                matched = list(dict.fromkeys(candidate.matched_criteria + [reason]))
+                finalized.append(candidate.model_copy(update={
+                    "decision_evidence_ids": evidence_ids,
+                    "matched_criteria": matched,
+                    "missing_criteria": [item for item in candidate.missing_criteria if "employee count" not in item.lower()],
+                    "employee_count": lower if lower == upper else candidate.employee_count,
+                    "verification_notes": candidate.verification_notes + [reason],
+                }))
+            else:
+                uncertain_count += 1
+                reason = f"Independent employee-size evidence reports {count_label} ({source_label}), which does not fully establish the requested range."
+                finalized.append(candidate.model_copy(update={
+                    "decision": Decision.UNCERTAIN,
+                    "confidence": min(candidate.confidence, 0.68),
+                    "rationale": reason,
+                    "missing_criteria": list(dict.fromkeys(candidate.missing_criteria + [reason])),
+                    "decision_evidence_ids": evidence_ids,
+                    "verification_notes": candidate.verification_notes + [reason],
+                }))
+
+        return {
+            "candidates": _candidate_dicts(finalized),
+            "events": [_event(
+                "strict_employee_check",
+                "ok",
+                "Applied strict employee-size criteria using independent public sources before proposal preparation.",
+                checked=len(eligible),
+                verified=verified_count,
+                rejected=rejected_count,
+                uncertain=uncertain_count,
+                additional_searches=len(search_targets),
+                llm_batches=llm_batches,
+            )],
+        }
+
+    def route_to_proposal(state: AgentState) -> Literal["strict_employee_check", "prepare_proposal"]:
+        request = LeadRequest.model_validate(state["request"])
+        return "strict_employee_check" if request.strict_search else "prepare_proposal"
+
+    def route_after_discovery(state: AgentState) -> Literal["research_candidates", "strict_employee_check", "prepare_proposal"]:
         if state.get("new_results_count", 0) == 0:
-            return "prepare_proposal"
+            return route_to_proposal(state)
         return "research_candidates"
 
-    def route_after_dedup(state: AgentState) -> Literal["extract_directory_links", "fast_verify", "discover_candidates", "prepare_proposal"]:
+    def route_after_dedup(state: AgentState) -> Literal["extract_directory_links", "fast_verify", "discover_candidates", "strict_employee_check", "prepare_proposal"]:
         request = LeadRequest.model_validate(state["request"])
         pending = state.get("unprocessed_urls", [])
         if pending and any(is_business_directory(r.get("url", ""), r.get("title", ""), r.get("snippet", "")) for r in pending):
@@ -754,13 +1021,13 @@ def create_graph(
             return "fast_verify"
         if int(state.get("search_round", 0)) < search_round_limit(request):
             return "discover_candidates"
-        return "prepare_proposal"
+        return route_to_proposal(state)
 
-    def route_after_cheap_filter(state: AgentState) -> Literal["deep_qualify", "discover_candidates", "prepare_proposal"]:
+    def route_after_cheap_filter(state: AgentState) -> Literal["deep_qualify", "discover_candidates", "strict_employee_check", "prepare_proposal"]:
         request = LeadRequest.model_validate(state["request"])
         if any(c.pre_qualified for c in _candidate_objects(state)):
             return "deep_qualify"
-        return "discover_candidates" if int(state.get("search_round", 0)) < search_round_limit(request) else "prepare_proposal"
+        return "discover_candidates" if int(state.get("search_round", 0)) < search_round_limit(request) else route_to_proposal(state)
 
     def route_after_deep_qualify(state: AgentState) -> Literal["targeted_research", "verify_websites"]:
         candidates = _candidate_objects(state)
@@ -773,7 +1040,7 @@ def create_graph(
             return "targeted_research"
         return "verify_websites"
 
-    def route_after_verification(state: AgentState) -> Literal["discover_candidates", "prepare_proposal"]:
+    def route_after_verification(state: AgentState) -> Literal["discover_candidates", "strict_employee_check", "prepare_proposal"]:
         request = LeadRequest.model_validate(state["request"])
         candidates = _candidate_objects(state)
         active_qualified = sum(
@@ -781,7 +1048,7 @@ def create_graph(
             for c in candidates
         )
         if active_qualified >= request.target_leads or int(state.get("search_round", 0)) >= search_round_limit(request):
-            return "prepare_proposal"
+            return route_to_proposal(state)
         return "discover_candidates"
 
     async def prepare_proposal(state: AgentState) -> dict[str, Any]:
@@ -1070,6 +1337,7 @@ def create_graph(
     builder.add_node("deep_qualify", track_usage(deep_qualify))
     builder.add_node("targeted_research", track_usage(targeted_research))
     builder.add_node("verify_websites", track_usage(verify_websites))
+    builder.add_node("strict_employee_check", track_usage(strict_employee_check))
     builder.add_node("prepare_proposal", track_usage(prepare_proposal))
     builder.add_node("approval_gate", track_usage(approval_gate))
     builder.add_node("execute_import", track_usage(execute_import))
@@ -1079,14 +1347,15 @@ def create_graph(
     builder.add_edge(START, "validate_input")
     builder.add_edge("validate_input", "discover_candidates")
     builder.add_edge("discover_candidates", "deduplicate")
-    builder.add_conditional_edges("deduplicate", route_after_dedup, {"extract_directory_links": "extract_directory_links", "fast_verify": "fast_verify", "discover_candidates": "discover_candidates", "prepare_proposal": "prepare_proposal"})
+    builder.add_conditional_edges("deduplicate", route_after_dedup, {"extract_directory_links": "extract_directory_links", "fast_verify": "fast_verify", "discover_candidates": "discover_candidates", "strict_employee_check": "strict_employee_check", "prepare_proposal": "prepare_proposal"})
     builder.add_edge("extract_directory_links", "cheap_filter")
     builder.add_edge("fast_verify", "research_candidates")
     builder.add_edge("research_candidates", "cheap_filter")
-    builder.add_conditional_edges("cheap_filter", route_after_cheap_filter, {"deep_qualify": "deep_qualify", "discover_candidates": "discover_candidates", "prepare_proposal": "prepare_proposal"})
+    builder.add_conditional_edges("cheap_filter", route_after_cheap_filter, {"deep_qualify": "deep_qualify", "discover_candidates": "discover_candidates", "strict_employee_check": "strict_employee_check", "prepare_proposal": "prepare_proposal"})
     builder.add_conditional_edges("deep_qualify", route_after_deep_qualify, {"targeted_research": "targeted_research", "verify_websites": "verify_websites"})
     builder.add_edge("targeted_research", "deep_qualify")
-    builder.add_conditional_edges("verify_websites", route_after_verification, {"discover_candidates": "discover_candidates", "prepare_proposal": "prepare_proposal"})
+    builder.add_conditional_edges("verify_websites", route_after_verification, {"discover_candidates": "discover_candidates", "strict_employee_check": "strict_employee_check", "prepare_proposal": "prepare_proposal"})
+    builder.add_edge("strict_employee_check", "prepare_proposal")
     builder.add_conditional_edges("prepare_proposal", route_proposal, {"approval_gate": "approval_gate", "build_report": "build_report"})
     builder.add_conditional_edges("approval_gate", route_approval, {"execute_import": "execute_import", "build_report": "build_report"})
     builder.add_edge("execute_import", "verify_import")

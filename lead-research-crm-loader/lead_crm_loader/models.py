@@ -56,6 +56,7 @@ class LeadRequest(StrictModel):
     qualification_criteria: list[str] = Field(min_length=1, max_length=20)
     target_leads: int = Field(default=50, ge=1, le=200)
     test_mode: bool = False
+    strict_search: bool = False
 
     @field_validator("request_id", "industry", "region")
     @classmethod
@@ -136,6 +137,25 @@ class CandidateClassification(Classification):
 
 class BatchClassification(StrictModel):
     classifications: list[CandidateClassification]
+
+
+class EmployeeCountAssessment(StrictModel):
+    candidate_id: str
+    company_match: bool = False
+    employee_min: int | None = Field(default=None, ge=0)
+    employee_max: int | None = Field(default=None, ge=0)
+    evidence_ids: list[str] = Field(default_factory=list)
+    rationale: str = ""
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "EmployeeCountAssessment":
+        if self.employee_min is not None and self.employee_max is not None and self.employee_min > self.employee_max:
+            raise ValueError("employee_min cannot exceed employee_max")
+        return self
+
+
+class BatchEmployeeCountAssessment(StrictModel):
+    assessments: list[EmployeeCountAssessment]
 
 
 class RunUsageSummary(StrictModel):
