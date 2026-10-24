@@ -24,16 +24,7 @@ WORKDIR /app
 COPY --chown=appuser:appuser lead-research-crm-loader/pyproject.toml ./
 COPY --chown=appuser:appuser lead-research-crm-loader/lead_crm_loader/ lead_crm_loader/
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -e ".[dev]"
-
-# Copy scenarios and documentation
-COPY --chown=appuser:appuser lead-research-crm-loader/tests/ tests/
-COPY --chown=appuser:appuser lead-research-crm-loader/examples/ examples/
-COPY --chown=appuser:appuser lead-research-crm-loader/ARCHITECTURE.md lead-research-crm-loader/README.md ./
-COPY --chown=appuser:appuser lead-research-crm-loader/.env.example ./
-
-# Copy default .env if not mounted/provided
-RUN cp .env.example .env && chown appuser:appuser .env
+    pip install --no-cache-dir -e .
 
 USER appuser
 

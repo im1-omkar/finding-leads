@@ -27,11 +27,13 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - HOST=0.0.0.0
-      - PORT=8000
-      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/lead_crm_loader
+      HOST: 0.0.0.0
+      PORT: 8000
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/lead_crm_loader}
+      RESEARCH_ENABLED: ${RESEARCH_ENABLED:-true}
+      FRONTEND_ORIGINS: ${FRONTEND_ORIGINS:-http://localhost:3000}
     env_file:
-      - path: ./lead-research-crm-loader/.env
+      - path: ./.env
         required: false
     depends_on:
       postgres:
@@ -52,9 +54,9 @@ services:
     container_name: lead-research-worker
     command: ["python", "-m", "lead_crm_loader.worker"]
     environment:
-      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/lead_crm_loader
+      - DATABASE_URL=${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/lead_crm_loader}
     env_file:
-      - path: ./lead-research-crm-loader/.env
+      - path: ./.env
         required: false
     depends_on:
       postgres:

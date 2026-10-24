@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 @dataclass(frozen=True)
 class Settings:
     mock_mode: bool = True
+    research_enabled: bool = True
     llm_api_key: str | None = None
     llm_base_url: str | None = None
     llm_model: str = "gpt-4.1-mini"
@@ -38,6 +39,9 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         load_dotenv()
+        app_env = os.getenv("APP_ENV", "development").lower()
+        research_default = "false" if app_env == "production" else "true"
+        research_enabled = os.getenv("RESEARCH_ENABLED", research_default).lower() in {"1", "true", "yes", "on"}
         mock_mode = os.getenv("MOCK_MODE", "true").lower() in {"1", "true", "yes", "on"}
         openrouter_key = os.getenv("OPENROUTER_API_KEY")
         llm_key = os.getenv("LLM_API_KEY") or openrouter_key or os.getenv("OPENAI_API_KEY")
@@ -49,6 +53,7 @@ class Settings:
         number_of_leads = max(1, min(int(os.getenv("NUMBER_OF_LEADS", "20")), 200))
         return cls(
             mock_mode=mock_mode,
+            research_enabled=research_enabled,
             llm_api_key=llm_key,
             llm_base_url=base_url,
             llm_model=os.getenv("LLM_MODEL", default_model),

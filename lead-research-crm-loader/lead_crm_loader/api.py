@@ -58,6 +58,39 @@ class EmailBody(BaseModel):
     email: str = Field(min_length=3, max_length=320)
 
 
+class NoStoreMiddleware:
+    """Prevent user-specific API responses from being cached by an edge proxy."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        api_path = path in {"/config", "/health"} or path == "/runs" or path.startswith(
+            ("/auth/", "/runs/", "/crm/", "/mock-crm/")
+        )
+        if not api_path:
+            await self.app(scope, receive, send)
+            return
+
+        async def send_no_store(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.start":
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() != b"cache-control"
+                ]
+                headers.append((b"cache-control", b"no-store"))
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_no_store)
+
+
 class ResetBody(TokenBody):
     password: str = Field(min_length=10, max_length=256)
 
@@ -80,7 +113,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     if os.getenv("APP_ENV", "development").lower() == "production" and len(os.getenv("APP_SESSION_SECRET", "")) < 32:
         raise RuntimeError("Production requires APP_SESSION_SECRET to contain at least 32 characters.")
-    if not settings.mock_mode:
+    if settings.research_enabled and not settings.mock_mode:
         settings.validate_for_live_mode()
     _configure_langsmith(settings)
 
@@ -128,6 +161,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=["GET", "POST"],
         allow_headers=["Content-Type", "Last-Event-ID", "X-CSRF-Token"],
     )
+    app.add_middleware(NoStoreMiddleware)
     app.state.settings = settings
     app.state.crm_adapter = crm_adapter
     app.state.run_store = store
@@ -160,6 +194,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/config")
     async def public_config() -> dict[str, Any]:
         return {
+            "research_enabled": settings.research_enabled,
             "number_of_leads": settings.number_of_leads,
             "test_mode_browserbase_call_limit": settings.test_mode_browserbase_call_limit,
             "test_mode_llm_call_limit": settings.test_mode_llm_call_limit,
@@ -257,6 +292,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def start_run(request_body: LeadRequest, request: Request) -> dict[str, Any]:
         user = await current_user(request)
         validate_csrf(request)
+        if not settings.research_enabled:
+            raise HTTPException(status_code=503, detail="Research is disabled in this deployment.")
         if request_body.test_mode:
             try:
                 settings.validate_for_live_mode()
@@ -340,6 +377,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def resume_with_approval(run_id: str, body: ApprovalBody, request: Request) -> dict[str, Any]:
         user = await current_user(request)
         validate_csrf(request)
+        if not settings.research_enabled:
+            raise HTTPException(status_code=503, detail="Research approvals are disabled in this deployment.")
         try:
             decision = ApprovalDecision.model_validate({**body.model_dump(), "reviewer_id": user["email"]})
         except Exception as exc:

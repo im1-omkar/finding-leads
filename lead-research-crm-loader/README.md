@@ -9,17 +9,17 @@ The default setup is safe for development: `MOCK_MODE=true` uses synthetic fixtu
 From the repository root:
 
 ```bash
-test -f lead-research-crm-loader/.env || cp lead-research-crm-loader/.env.example lead-research-crm-loader/.env
+test -f .env || cp .env.example .env
 docker compose up --build
 ```
 
 Open the UI at <http://localhost:3000>, the API docs at <http://localhost:8000/docs>, or check API health at <http://localhost:8000/health>. Compose starts PostgreSQL, the API, a durable background worker, and the frontend. Stop it with `Ctrl+C`; run `docker compose down` to stop and remove the containers. PostgreSQL data remains in the `postgres_data` volume. `docker compose down -v` also deletes that volume.
 
-Use `docker compose logs -f backend worker frontend` to inspect application logs. For a clean rebuild, use `docker compose up --build` again.
+Use `docker compose logs -f backend worker frontend` to inspect application logs. For a clean rebuild, use `docker compose up --build` again. The primary Compose workflow uses the root `.env`; copy the root `.env.example` there and edit it before starting.
 
 ## Configure the number of leads
 
-Set `NUMBER_OF_LEADS` in `lead-research-crm-loader/.env`:
+Set `NUMBER_OF_LEADS` in the root `.env`:
 
 ```dotenv
 NUMBER_OF_LEADS=20
@@ -45,14 +45,14 @@ docker compose up --build --force-recreate
 4. Review the versioned proposal and select the company records to import. No CRM write occurs before approval.
 5. After approval, the worker upserts selected records to PostgreSQL and reads them back to verify name/domain.
 
-Account verification and password reset links expire after 30 minutes and are single-use. Sessions last seven days and are stored server-side; only a random token is placed in an HttpOnly cookie. In development, auth links are written to backend logs. Configure SMTP before production use:
+Account verification and password reset links expire after 30 minutes and are single-use. Sessions last seven days and are stored server-side; only a random token is placed in an HttpOnly cookie. In development, auth links are written to backend logs. Configure SMTP before production use. On Render Free, use a relay that supports STARTTLS on an allowed port such as 2525; ports 25, 465, and 587 are blocked:
 
 ```dotenv
 APP_ENV=production
 APP_SESSION_SECRET=generate-a-random-secret-of-at-least-32-characters
 FRONTEND_PUBLIC_URL=https://your-app.example
 SMTP_HOST=smtp.your-provider.example
-SMTP_PORT=587
+SMTP_PORT=2525
 SMTP_FROM=Lead Research <noreply@your-app.example>
 SMTP_USERNAME=your-smtp-user
 SMTP_PASSWORD=your-smtp-password
@@ -67,7 +67,7 @@ The API exposes `/auth/register`, `/auth/login`, `/auth/logout`, `/auth/me`, `/a
 
 ## Live research setup
 
-Add your credentials to `lead-research-crm-loader/.env` without committing the file:
+For local Compose, add your credentials to the root `.env` without committing the file:
 
 ```dotenv
 MOCK_MODE=false
